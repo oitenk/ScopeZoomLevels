@@ -1,0 +1,15 @@
+# Release zips are built by tools/build.sh and attached to releases instead.
+dist/
+*.zip
+
+# Build scratch: vanilla files extracted from the game, JSON, patch meshes before packing.
+_build/
+
+# Anything not for release, kept locally for reference only.
+_archive/
+
+# Screenshots and clips for the mod page.
+promo/
+
+# Python bytecode from the build tools.
+__pycache__/

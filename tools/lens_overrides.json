@@ -1,0 +1,17 @@
+{
+  "_about": "Extra lens material (glass_scope.mt) parameters per scope model, on top of the zoom level's magnification. 'all' applies to every level, '1'/'2'/'3' to one level and win over 'all'. Vectors are [x, y, z, w], colours {\"rgb\": [r, g, b]}.",
+
+  "_learned": [
+    "Kanone Mini (2026-10-27): changing EyeRelief to the E255's values looks bad.",
+    "ClearVue Mk.8 (2026-10-27, four test rounds): the second, differently zoomed image in the lens comes from the strong lens bulge and from the 4th part of UseMask (the ScopeMaskFar texture strip, drawn without the lens effect, so unmagnified). Darkening that strip (black ScopeInside, MaskOpacity 1) does not hide it.",
+    "ClearVue: the dark soft edge at the bottom of the lens comes from the vanilla sphere masks (SphereMaskClose/Far). Widening them removes the edge, so keep them as vanilla."
+  ],
+
+  "w_att__scope_long_03": {
+    "_fix": "ClearVue Mk.8: no double image, dark bottom edge kept (tested in game).",
+    "all": {
+      "LensBulgeStrength": 0.0,
+      "UseMask": [0.0, 0.0, 1.0, 0.0]
+    }
+  }
+}

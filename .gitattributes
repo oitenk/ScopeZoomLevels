@@ -1,0 +1,2 @@
+# Shell scripts keep Unix line endings so Git Bash can run them.
+*.sh text eol=lf

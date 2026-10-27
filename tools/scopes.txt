@@ -1,0 +1,19 @@
+# Scopes that get lens zoom levels.
+# <model (the scope item's appearanceResourceName)>  <magnification per level...>
+# A scope with no numbers gets no lens zoom. All scopes have the same 3 test levels for now.
+w_att__scope_short_01   1.3 1.6 2.0   # OS-1 Gimlet Eye
+w_att__scope_short_02   1.3 1.6 2.0   # Hyakume
+w_att__scope_short_03                 # Add-Vantage (no magnifying lens: no levels possible)
+w_att__scope_short_04   1.3 1.6 2.0   # CQO Kanone Mini Mk.72 (no zoom planned)
+w_att__scope_short_05                 # Type 2067 (plain glass, not the scope lens shader)
+w_att__scope_short_06   1.3 1.6 2.0   # Handyman
+w_att__scope_short_07                 # Kanetsugu (no magnifying lens)
+w_att__scope_long_01    1.3 1.6 2.0   # Mk.2x Grandstand
+w_att__scope_long_02    1.3 1.6 2.0   # E255 Percipient
+w_att__scope_long_03    1.3 1.6 2.0   # ClearVue Mk.8 (lens fix in lens_overrides.json)
+w_att__scope_long_04                  # SO-21 Saika (no magnifying lens)
+w_att__scope_long_05    1.3 1.6 2.0
+w_att__scope_long_06                  # Kairo SA-1, Phantom Liberty (no magnifying lens)
+w_att__scope_sniper_01  1.3 1.6 2.0
+w_att__scope_sniper_02  1.3 1.6 2.0
+w_att__scope_sniper_03  1.3 1.6 2.0
