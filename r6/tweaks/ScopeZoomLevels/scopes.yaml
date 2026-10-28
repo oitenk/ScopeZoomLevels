@@ -2,35 +2,33 @@
 # Lens zoom levels per scope model (the item's appearanceResourceName), in the same
 # form other mods use for their own scopes. See README, "For mod authors".
 
-ScopeZoomLevels.w_att__scope_short_01.lensParts: [ n"w_att__scope_short_01_015017" ]
-ScopeZoomLevels.w_att__scope_short_01.zoomLevels: [ 1.3, 1.6, 2.0 ]
-
 ScopeZoomLevels.w_att__scope_short_02.lensParts: [ n"w_att__scope_short_02_012834" ]
-ScopeZoomLevels.w_att__scope_short_02.zoomLevels: [ 1.3, 1.6, 2.0 ]
-
-ScopeZoomLevels.w_att__scope_short_04.lensParts: [ n"w_att__scope_short_04_016232" ]
-ScopeZoomLevels.w_att__scope_short_04.zoomLevels: [ 1.3, 1.6, 2.0 ]
-
-ScopeZoomLevels.w_att__scope_short_06.lensParts: [ n"w_att__scope_short_06_01" ]
-ScopeZoomLevels.w_att__scope_short_06.zoomLevels: [ 1.3, 1.6, 2.0 ]
+ScopeZoomLevels.w_att__scope_short_02.zoomLevels: [ 1.3, 1.6 ]
 
 ScopeZoomLevels.w_att__scope_long_01.lensParts: [ n"w_att__scope_long_01_017225" ]
-ScopeZoomLevels.w_att__scope_long_01.zoomLevels: [ 1.3, 1.6, 2.0 ]
+ScopeZoomLevels.w_att__scope_long_01.zoomLevels: [ 1.6, 2.0, 3.0 ]
+ScopeZoomLevels.w_att__scope_long_01.noVanilla: true
 
 ScopeZoomLevels.w_att__scope_long_02.lensParts: [ n"w_att__scope_long_02_010120" ]
-ScopeZoomLevels.w_att__scope_long_02.zoomLevels: [ 1.3, 1.6, 2.0 ]
+ScopeZoomLevels.w_att__scope_long_02.zoomLevels: [ 1.6, 2.0, 3.0 ]
+ScopeZoomLevels.w_att__scope_long_02.noVanilla: true
 
 ScopeZoomLevels.w_att__scope_long_03.lensParts: [ n"w_att__scope_long_03_014631" ]
-ScopeZoomLevels.w_att__scope_long_03.zoomLevels: [ 1.3, 1.6, 2.0 ]
+ScopeZoomLevels.w_att__scope_long_03.zoomLevels: [ 1.6, 2.0, 3.0 ]
+ScopeZoomLevels.w_att__scope_long_03.noVanilla: true
 
 ScopeZoomLevels.w_att__scope_long_05.lensParts: [ n"w_att__scope_long_05_01" ]
-ScopeZoomLevels.w_att__scope_long_05.zoomLevels: [ 1.3, 1.6, 2.0 ]
+ScopeZoomLevels.w_att__scope_long_05.zoomLevels: [ 1.6, 2.0, 3.0 ]
+ScopeZoomLevels.w_att__scope_long_05.noVanilla: true
 
 ScopeZoomLevels.w_att__scope_sniper_01.lensParts: [ n"w_att__scope_sniper_01_010173" ]
-ScopeZoomLevels.w_att__scope_sniper_01.zoomLevels: [ 1.3, 1.6, 2.0 ]
+ScopeZoomLevels.w_att__scope_sniper_01.zoomLevels: [ 2.0, 3.0, 4.0 ]
+ScopeZoomLevels.w_att__scope_sniper_01.noVanilla: true
 
 ScopeZoomLevels.w_att__scope_sniper_02.lensParts: [ n"w_att__scope_sniper_02_015733" ]
-ScopeZoomLevels.w_att__scope_sniper_02.zoomLevels: [ 1.3, 1.6, 2.0 ]
+ScopeZoomLevels.w_att__scope_sniper_02.zoomLevels: [ 2.0, 3.0, 4.0 ]
+ScopeZoomLevels.w_att__scope_sniper_02.noVanilla: true
 
 ScopeZoomLevels.w_att__scope_sniper_03.lensParts: [ n"w_att__scope_sniper_03_018248", n"w_att__scope_sniper_03_01_cap", n"w_att__scope_sniper_03_8038" ]
-ScopeZoomLevels.w_att__scope_sniper_03.zoomLevels: [ 1.3, 1.6, 2.0 ]
+ScopeZoomLevels.w_att__scope_sniper_03.zoomLevels: [ 2.0, 3.0, 4.0 ]
+ScopeZoomLevels.w_att__scope_sniper_03.noVanilla: true

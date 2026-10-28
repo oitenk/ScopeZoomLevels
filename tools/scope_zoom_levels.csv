@@ -1,0 +1,17 @@
+Model,Name,Type,Lens zoom possible,Level 1,Level 2,Level 3,Level 4,Level 5,Level 6,Notes
+w_att__scope_short_01,OS-1 GimletEye,Short,Yes,,,,,,,
+w_att__scope_short_02,Hyakume,Short,Yes,1.3,1.6,,,,,
+w_att__scope_short_03,Add-Vantage,Short,No (no magnifying lens),,,,,,,
+w_att__scope_short_04,CQO Kanone MINI Mk.72,Short,Yes,,,,,,,
+w_att__scope_short_05,Type 2067,Short,No (plain glass),,,,,,,
+w_att__scope_short_06,Handyman,Short,Yes,,,,,,,
+w_att__scope_short_07,Kanetsugu,Short,No (no magnifying lens),,,,,,,
+w_att__scope_long_01,Grandstand Mk.2x,Long,Yes,,1.6,2,3,,,
+w_att__scope_long_02,E255 Percipient,Long,Yes,,1.6,2,3,,,
+w_att__scope_long_03,ClearVue Mk.8,Long,Yes,,1.6,2,3,,,
+w_att__scope_long_04,SO-21 Saika,Long,No (no magnifying lens),,,,,,,
+w_att__scope_long_05,Jue,Long,Yes,,1.6,2,3,,,
+w_att__scope_long_06,Kairo SA-1,Long,No (no magnifying lens),,,,,,,Phantom Liberty
+w_att__scope_sniper_01,HPO Kanone MAX Mk.77,Sniper,Yes,,,2,3,4,,
+w_att__scope_sniper_02,E305 Prospecta,Sniper,Yes,,,2,3,4,,
+w_att__scope_sniper_03,Gaki,Sniper,Yes,,,2,3,4,,

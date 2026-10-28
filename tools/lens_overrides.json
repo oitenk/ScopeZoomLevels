@@ -1,5 +1,5 @@
 {
-  "_about": "Extra lens material (glass_scope.mt) parameters per scope model, on top of the zoom level's magnification. 'all' applies to every level, '1'/'2'/'3' to one level and win over 'all'. Vectors are [x, y, z, w], colours {\"rgb\": [r, g, b]}.",
+  "_about": "Extra lens material (glass_scope.mt) parameters per scope model, on top of the zoom level's magnification. 'all' applies to every level, '1'/'2'/... to one level and win over 'all'. Vectors are [x, y, z, w], colours {\"rgb\": [r, g, b]}.",
 
   "_learned": [
     "Kanone Mini (2026-10-27): changing EyeRelief to the E255's values looks bad.",

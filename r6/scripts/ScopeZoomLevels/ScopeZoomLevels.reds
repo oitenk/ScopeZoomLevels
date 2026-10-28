@@ -1,4 +1,4 @@
-// Scope Zoom Levels (prototype): a key cycles how much the scope lens magnifies.
+// Scope Zoom Levels 1.0.0: a key cycles how much the scope lens magnifies.
 // Each zoom level is an extra mesh appearance on the scope's lens part, named
 // "<skin>_szl<level>". Level 0 is the vanilla appearance.
 //
@@ -6,6 +6,9 @@
 // appearanceResourceName), so every item, variant and skin copy of that scope shares them:
 //   ScopeZoomLevels.<model>.lensParts: [ n"<lens mesh component>" ]
 //   ScopeZoomLevels.<model>.zoomLevels: [ 1.3, 1.6, 2.0 ]   // levels 1, 2, 3 (magnification)
+// and optionally drops the vanilla level, so aiming starts at level 1 and the key cycles
+// only the zoom levels:
+//   ScopeZoomLevels.<model>.noVanilla: true
 // Our own scopes are declared in r6\tweaks\ScopeZoomLevels\scopes.yaml.
 module ScopeZoomLevels
 
@@ -15,6 +18,7 @@ public class SZLLens {
   public let weapon: wref<ItemObject>;
   public let parts: array<ref<entSkinnedMeshComponent>>;
   public let levels: array<Float>;
+  public let noVanilla: Bool; // no vanilla level while aiming: the cycle is levels 1..n
 }
 
 // Runs the display re-attach again a moment after an appearance switch, once the
@@ -42,6 +46,12 @@ public class SZLSettings {
   public let noAimZoom: Bool = true;
 
   @runtimeProperty("ModSettings.mod", "Scope Zoom Levels")
+  @runtimeProperty("ModSettings.category", "Aiming")
+  @runtimeProperty("ModSettings.displayName", "Remember zoom level per weapon")
+  @runtimeProperty("ModSettings.description", "On: each weapon keeps the zoom level you last chose. Off: every aim starts at the scope's first level.")
+  public let rememberLevel: Bool = true;
+
+  @runtimeProperty("ModSettings.mod", "Scope Zoom Levels")
   @runtimeProperty("ModSettings.category", "Debug")
   @runtimeProperty("ModSettings.displayName", "Debug logging")
   public let debugLog: Bool = false;
@@ -49,7 +59,9 @@ public class SZLSettings {
 
 public class SZLSystem extends ScriptableSystem {
   private let m_settings: ref<SZLSettings>;
-  private let m_level: Int32;
+  // The chosen level per weapon (same index in both arrays). A weapon not listed is at level 0.
+  private let m_levelWeapons: array<ItemID>;
+  private let m_levelValues: array<Int32>;
   private let m_upperBodyCallback: ref<CallbackHandle>;
   private let m_psm: wref<IBlackboard>;
   private let m_lastReported: ItemID; // so a miss is logged once per weapon, not every key press
@@ -88,8 +100,13 @@ public class SZLSystem extends ScriptableSystem {
 
   // The lens only magnifies while aiming: it enlarges what is drawn behind it on screen,
   // which is the scene when aiming but the gun itself when not. Not aiming, the lens goes
-  // back to vanilla; the chosen level is kept for the next aim.
+  // back to vanilla; the chosen level is kept for the next aim, unless "Remember zoom level
+  // per weapon" is off, then every aim starts at the scope's first level.
   protected cb func OnUpperBodyChanged(state: Int32) -> Bool {
+    if !this.m_settings.rememberLevel && !this.IsAiming() {
+      ArrayClear(this.m_levelWeapons);
+      ArrayClear(this.m_levelValues);
+    }
     this.Apply(false);
     return true;
   }
@@ -101,17 +118,39 @@ public class SZLSystem extends ScriptableSystem {
     this.Apply(true);
   }
 
-  // Finds the lens of the fitted scope and gives it the current level (capped to the
+  // The level last chosen for a weapon (0 if none).
+  private func GetLevel(weapon: ItemID) -> Int32 {
+    let i: Int32 = 0;
+    while i < ArraySize(this.m_levelWeapons) {
+      if this.m_levelWeapons[i] == weapon { return this.m_levelValues[i]; }
+      i += 1;
+    }
+    return 0;
+  }
+
+  private func SetLevel(weapon: ItemID, level: Int32) -> Void {
+    let i: Int32 = 0;
+    while i < ArraySize(this.m_levelWeapons) {
+      if this.m_levelWeapons[i] == weapon { this.m_levelValues[i] = level; return; }
+      i += 1;
+    }
+    ArrayPush(this.m_levelWeapons, weapon);
+    ArrayPush(this.m_levelValues, level);
+  }
+
+  // Finds the lens of the fitted scope and gives it the weapon's level (capped to the
   // levels that scope has), or vanilla when not aiming. With advance set, moves to the
-  // next level first.
+  // next level first. A scope without a vanilla level starts at level 1 and cycles 1..n.
   private func Apply(advance: Bool) -> Void {
     let lens: ref<SZLLens> = this.FindLens(advance);
     if !IsDefined(lens) { return; }
-    let count: Int32 = ArraySize(lens.levels) + 1; // level 0 is vanilla
-    let level: Int32 = Min(this.m_level, count - 1);
+    let last: Int32 = ArraySize(lens.levels);      // level 0 is vanilla
+    let first: Int32 = lens.noVanilla ? 1 : 0;
+    let weaponID: ItemID = lens.weapon.GetItemID();
+    let level: Int32 = Max(Min(this.GetLevel(weaponID), last), first);
     if advance {
-      level = (level + 1) % count;
-      this.m_level = level;
+      level = level >= last ? first : level + 1;
+      this.SetLevel(weaponID, level);
     }
     if !this.IsAiming() { level = 0; }
     let zoom: String = level > 0 ? FloatToStringPrec(lens.levels[level - 1], 2) + "x" : "vanilla";
@@ -177,6 +216,7 @@ public class SZLSystem extends ScriptableSystem {
     let lens: ref<SZLLens> = new SZLLens();
     lens.weapon = weapon;
     lens.levels = TDB.GetFloatArray(TDBID.Create("ScopeZoomLevels." + model + ".zoomLevels"));
+    lens.noVanilla = TDB.GetBool(TDBID.Create("ScopeZoomLevels." + model + ".noVanilla"));
     let names: array<CName> = TDB.GetCNameArray(TDBID.Create("ScopeZoomLevels." + model + ".lensParts"));
     if ArraySize(lens.levels) > 0 {
       for name in names {

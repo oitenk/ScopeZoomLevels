@@ -10,14 +10,8 @@ resource:
       - base\weapons\firearms\attachments\scope\w_att__scope_long_03\entities\meshes\w_att__scope_long_03_01.mesh
     scope_zoom_levels\patches\w_att__scope_long_05_01.mesh:
       - base\weapons\firearms\attachments\scope\w_att__scope_long_05\entities\meshes\w_att__scope_long_05_01.mesh
-    scope_zoom_levels\patches\w_att__scope_short_01_01.mesh:
-      - base\weapons\firearms\attachments\scope\w_att__scope_short_01\entities\meshes\w_att__scope_short_01_01.mesh
     scope_zoom_levels\patches\w_att__scope_short_02_01.mesh:
       - base\weapons\firearms\attachments\scope\w_att__scope_short_02\entities\meshes\w_att__scope_short_02_01.mesh
-    scope_zoom_levels\patches\w_att__scope_short_04_01.mesh:
-      - base\weapons\firearms\attachments\scope\w_att__scope_short_04\entities\meshes\w_att__scope_short_04_01.mesh
-    scope_zoom_levels\patches\w_att__scope_short_06_01.mesh:
-      - base\weapons\firearms\attachments\scope\w_att__scope_short_06\entities\meshes\w_att__scope_short_06_01.mesh
     scope_zoom_levels\patches\w_att__scope_sniper_01_01.mesh:
       - base\weapons\firearms\attachments\scope\w_att__scope_sniper_01\entities\meshes\w_att__scope_sniper_01_01.mesh
     scope_zoom_levels\patches\w_att__scope_sniper_02_01.mesh:

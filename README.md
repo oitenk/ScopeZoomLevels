@@ -1,11 +1,19 @@
-# Scope Zoom Levels (prototype)
+# Scope Zoom Levels
 
 Cycles how much a scope's lens magnifies, with one key, while the view around the scope
 stays at normal field of view.
 
-All standard scopes that have a magnifying lens (11, all skins, Skin Changer Plus skins
-included). The Add-Vantage, Type 2067, Kanetsugu, SO-21 Saika and Kairo SA-1 have no lens
-glass the trick can use, so they have no zoom. The list is `tools/scopes.txt`.
+Scopes with zoom levels (all skins, Skin Changer Plus skins included):
+
+| Scope | Zoom levels |
+|---|---|
+| Hyakume | vanilla, 1.3×, 1.6× |
+| Grandstand Mk.2x, E255 Percipient, ClearVue Mk.8, Jue | 1.6×, 2×, 3× (no vanilla level) |
+| HPO Kanone MAX Mk.77, E305 Prospecta, Gaki | 2×, 3×, 4× (no vanilla level) |
+
+The OS-1 GimletEye, CQO Kanone MINI Mk.72 and Handyman stay vanilla. The Add-Vantage,
+Type 2067, Kanetsugu, SO-21 Saika and Kairo SA-1 have no lens glass the trick can use, so
+they have no zoom. The list is `tools/scopes.txt`.
 
 ## How it works
 
@@ -35,12 +43,15 @@ Codeware, ArchiveXL, TweakXL. Mod Settings is optional.
 ## Controls
 
 Mouse button 5 (forward thumb button) cycles through the fitted scope's levels and back to
-vanilla. Change it in Mod Settings.
+the first one (vanilla, for scopes that keep it). Scopes without a vanilla level start at
+their first zoom level when you aim. Change the key in Mod Settings.
 
 ## Settings (Mod Settings)
 
 - **Next lens zoom level**: the key that cycles the levels.
 - **No camera zoom when aiming**: on by default; turn off for vanilla camera zoom.
+- **Remember zoom level per weapon**: on by default, each weapon keeps the level you last
+  chose. Off: every aim starts at the scope's first level.
 - **Debug logging**: writes what the mod does to the CET game log.
 
 ## For mod authors
@@ -58,14 +69,18 @@ installed, the lines below are ignored.
 ```yaml
 ScopeZoomLevels.my_scope_model.lensParts: [ n"my_scope_lens_component" ]
 ScopeZoomLevels.my_scope_model.zoomLevels: [ 1.5, 2.5, 4.0 ]   # levels 1, 2, 3
+ScopeZoomLevels.my_scope_model.noVanilla: true                 # optional
 ```
 
 `lensParts` names the mesh component(s) in your scope's `.app` that hold the lens.
 `zoomLevels` has one entry per `_szl` appearance, in order; leave the lines out for no lens zoom.
+`noVanilla` drops the vanilla level while aiming: the scope starts at level 1 and the key
+cycles only its zoom levels. Leave it out to keep vanilla as the first level.
 
 ## Building
 
-Add a scope's model name and its magnifications to `tools/scopes.txt`, then run
+Add a scope's model name and its magnifications to `tools/scopes.txt` (with `no-vanilla`
+before the numbers to drop its vanilla level), then run
 `bash tools/build.sh`. It extracts the vanilla scopes from the installed game, builds the patch
 meshes, writes the `.xl` and `scopes.yaml`, packs `archive\pc\mod\ScopeZoomLevels.archive`
 and writes `dist\ScopeZoomLevels.zip`. Needs WolvenKit.CLI and Python.
