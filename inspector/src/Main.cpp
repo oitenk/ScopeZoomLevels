@@ -279,6 +279,138 @@ std::string ViewText(SIZE_T aHandle)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Shader inputs: which texture each SRV/UAV descriptor points at, followed through descriptor
+// copies into the shader-visible heap, and root signature table layouts, so a bound descriptor
+// table can be listed as the textures a draw or dispatch reads (S) and writes (U).
+
+struct DescInfo
+{
+    ID3D12Resource* resource = nullptr;
+    char kind = '?';
+};
+
+std::shared_mutex g_descMutex;
+std::unordered_map<SIZE_T, DescInfo> g_descs;
+UINT g_viewStep = 0;
+
+struct HeapInfo
+{
+    SIZE_T cpu = 0;
+    UINT64 gpu = 0;
+    UINT count = 0;
+};
+std::shared_mutex g_heapMutex;
+std::vector<HeapInfo> g_heaps;
+
+struct TableEntry
+{
+    UINT offset;
+    char kind; // S, U, C (constant buffer), m (sampler)
+};
+struct RootSigInfo
+{
+    std::vector<std::vector<TableEntry>> tables; // per root parameter; empty if not a table
+};
+std::shared_mutex g_rsMutex;
+std::unordered_map<void*, RootSigInfo> g_rootSigs;
+
+using DeserializerFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, REFIID, void**);
+DeserializerFn g_deserializer = nullptr;
+
+void RegisterRootSig(void* aRs, const void* aBlob, SIZE_T aSize)
+{
+    if (!g_deserializer || !aRs || !aBlob)
+        return;
+    ID3D12VersionedRootSignatureDeserializer* des = nullptr;
+    if (FAILED(g_deserializer(aBlob, aSize, IID_PPV_ARGS(&des))))
+        return;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
+    RootSigInfo info;
+    if (SUCCEEDED(des->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc)
+    {
+        const auto& d = desc->Desc_1_1;
+        info.tables.resize(d.NumParameters);
+        for (UINT p = 0; p < d.NumParameters; ++p)
+        {
+            const auto& param = d.pParameters[p];
+            if (param.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+                continue;
+            UINT running = 0;
+            for (UINT r = 0; r < param.DescriptorTable.NumDescriptorRanges; ++r)
+            {
+                const auto& range = param.DescriptorTable.pDescriptorRanges[r];
+                UINT start = range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                                 ? running
+                                 : range.OffsetInDescriptorsFromTableStart;
+                UINT count = range.NumDescriptors == UINT_MAX ? 8 : std::min<UINT>(range.NumDescriptors, 16);
+                char kind = range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV   ? 'S'
+                            : range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV ? 'U'
+                            : range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV ? 'C'
+                                                                                 : 'm';
+                for (UINT i = 0; i < count; ++i)
+                    info.tables[p].push_back(TableEntry{start + i, kind});
+                running = start + count;
+            }
+        }
+    }
+    des->Release();
+    std::unique_lock lock(g_rsMutex);
+    g_rootSigs[aRs] = std::move(info);
+}
+
+std::string ShortRes(ID3D12Resource* aRes)
+{
+    if (!aRes)
+        return "null";
+    D3D12_RESOURCE_DESC d = aRes->GetDesc();
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        return Fmt("%p buf%llu", aRes, static_cast<unsigned long long>(d.Width));
+    return Fmt("%p %llux%u%s f%d", aRes, static_cast<unsigned long long>(d.Width), d.Height,
+               d.DepthOrArraySize > 1 ? Fmt("x%u", d.DepthOrArraySize).c_str() : "", d.Format);
+}
+
+std::string TableText(void* aRootSig, UINT aIndex, D3D12_GPU_DESCRIPTOR_HANDLE aBase)
+{
+    SIZE_T cpu = 0;
+    {
+        std::shared_lock lock(g_heapMutex);
+        for (auto& h : g_heaps)
+        {
+            if (aBase.ptr >= h.gpu && aBase.ptr < h.gpu + static_cast<UINT64>(h.count) * g_viewStep)
+            {
+                cpu = h.cpu + static_cast<SIZE_T>(aBase.ptr - h.gpu);
+                break;
+            }
+        }
+    }
+    if (!cpu)
+        return Fmt("table r%u: not in a known heap", aIndex);
+    std::vector<TableEntry> entries;
+    {
+        std::shared_lock lock(g_rsMutex);
+        auto it = g_rootSigs.find(aRootSig);
+        if (it != g_rootSigs.end() && aIndex < it->second.tables.size())
+            entries = it->second.tables[aIndex];
+    }
+    bool guessed = entries.empty();
+    if (guessed)
+        for (UINT i = 0; i < 4; ++i)
+            entries.push_back(TableEntry{i, '?'});
+    std::string s = Fmt("table r%u%s:", aIndex, guessed ? " (layout unknown)" : "");
+    std::shared_lock lock(g_descMutex);
+    for (auto& e : entries)
+    {
+        if (e.kind == 'C' || e.kind == 'm')
+            continue;
+        auto it = g_descs.find(cpu + static_cast<SIZE_T>(e.offset) * g_viewStep);
+        if (it == g_descs.end() || !it->second.resource)
+            continue;
+        s += Fmt(" %c%u=", it->second.kind, e.offset) + ShortRes(it->second.resource);
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Capture: per command list recording, written in submission order.
 
 enum State : int
@@ -295,6 +427,8 @@ struct ListRecord
     std::vector<std::string> lines;
     bool fromReset = false;
     int depth = 0;
+    void* gfxRootSig = nullptr;
+    void* csRootSig = nullptr;
 };
 
 std::mutex g_listMutex;
@@ -548,6 +682,131 @@ void STDMETHODCALLTYPE HkCreateDepthStencilView(ID3D12Device* aSelf, ID3D12Resou
     g_views[aHandle.ptr] = ViewInfo{aRes, aDesc ? static_cast<int>(aDesc->Format) : -1};
 }
 
+HRESULT STDMETHODCALLTYPE HkCreateDescriptorHeap(ID3D12Device* aSelf, const D3D12_DESCRIPTOR_HEAP_DESC* aDesc,
+                                                 REFIID aRiid, void** aOut);
+ORIG(CreateDescriptorHeap);
+HRESULT STDMETHODCALLTYPE HkCreateDescriptorHeap(ID3D12Device* aSelf, const D3D12_DESCRIPTOR_HEAP_DESC* aDesc,
+                                                 REFIID aRiid, void** aOut)
+{
+    HRESULT hr = g_CreateDescriptorHeap(aSelf, aDesc, aRiid, aOut);
+    if (SUCCEEDED(hr) && aDesc && aOut && *aOut && aDesc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+        (aDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
+    {
+        ID3D12DescriptorHeap* heap = nullptr;
+        if (SUCCEEDED(static_cast<IUnknown*>(*aOut)->QueryInterface(IID_PPV_ARGS(&heap))))
+        {
+            HeapInfo info{heap->GetCPUDescriptorHandleForHeapStart().ptr, heap->GetGPUDescriptorHandleForHeapStart().ptr,
+                          aDesc->NumDescriptors};
+            heap->Release();
+            std::unique_lock lock(g_heapMutex);
+            g_heaps.push_back(info);
+            Info("shader-visible heap: %u descriptors", aDesc->NumDescriptors);
+        }
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HkCreateRootSignature(ID3D12Device* aSelf, UINT aMask, const void* aBlob, SIZE_T aSize,
+                                                REFIID aRiid, void** aOut);
+ORIG(CreateRootSignature);
+HRESULT STDMETHODCALLTYPE HkCreateRootSignature(ID3D12Device* aSelf, UINT aMask, const void* aBlob, SIZE_T aSize,
+                                                REFIID aRiid, void** aOut)
+{
+    HRESULT hr = g_CreateRootSignature(aSelf, aMask, aBlob, aSize, aRiid, aOut);
+    if (SUCCEEDED(hr) && aOut && *aOut)
+        RegisterRootSig(*aOut, aBlob, aSize);
+    return hr;
+}
+
+void SetDesc(SIZE_T aHandle, ID3D12Resource* aRes, char aKind)
+{
+    std::unique_lock lock(g_descMutex);
+    g_descs[aHandle] = DescInfo{aRes, aKind};
+}
+
+void STDMETHODCALLTYPE HkCreateShaderResourceView(ID3D12Device* aSelf, ID3D12Resource* aRes,
+                                                  const D3D12_SHADER_RESOURCE_VIEW_DESC* aDesc,
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE aHandle);
+ORIG(CreateShaderResourceView);
+void STDMETHODCALLTYPE HkCreateShaderResourceView(ID3D12Device* aSelf, ID3D12Resource* aRes,
+                                                  const D3D12_SHADER_RESOURCE_VIEW_DESC* aDesc,
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE aHandle)
+{
+    g_CreateShaderResourceView(aSelf, aRes, aDesc, aHandle);
+    SetDesc(aHandle.ptr, aRes, 'S');
+}
+
+void STDMETHODCALLTYPE HkCreateUnorderedAccessView(ID3D12Device* aSelf, ID3D12Resource* aRes, ID3D12Resource* aCounter,
+                                                   const D3D12_UNORDERED_ACCESS_VIEW_DESC* aDesc,
+                                                   D3D12_CPU_DESCRIPTOR_HANDLE aHandle);
+ORIG(CreateUnorderedAccessView);
+void STDMETHODCALLTYPE HkCreateUnorderedAccessView(ID3D12Device* aSelf, ID3D12Resource* aRes, ID3D12Resource* aCounter,
+                                                   const D3D12_UNORDERED_ACCESS_VIEW_DESC* aDesc,
+                                                   D3D12_CPU_DESCRIPTOR_HANDLE aHandle)
+{
+    g_CreateUnorderedAccessView(aSelf, aRes, aCounter, aDesc, aHandle);
+    SetDesc(aHandle.ptr, aRes, 'U');
+}
+
+void CopyRange(SIZE_T aDst, SIZE_T aSrc, UINT aCount)
+{
+    std::unique_lock lock(g_descMutex);
+    for (UINT i = 0; i < aCount; ++i)
+    {
+        auto it = g_descs.find(aSrc + static_cast<SIZE_T>(i) * g_viewStep);
+        if (it != g_descs.end())
+            g_descs[aDst + static_cast<SIZE_T>(i) * g_viewStep] = it->second;
+        else
+            g_descs.erase(aDst + static_cast<SIZE_T>(i) * g_viewStep);
+    }
+}
+
+void STDMETHODCALLTYPE HkCopyDescriptorsSimple(ID3D12Device* aSelf, UINT aCount, D3D12_CPU_DESCRIPTOR_HANDLE aDst,
+                                               D3D12_CPU_DESCRIPTOR_HANDLE aSrc, D3D12_DESCRIPTOR_HEAP_TYPE aType);
+ORIG(CopyDescriptorsSimple);
+void STDMETHODCALLTYPE HkCopyDescriptorsSimple(ID3D12Device* aSelf, UINT aCount, D3D12_CPU_DESCRIPTOR_HANDLE aDst,
+                                               D3D12_CPU_DESCRIPTOR_HANDLE aSrc, D3D12_DESCRIPTOR_HEAP_TYPE aType)
+{
+    g_CopyDescriptorsSimple(aSelf, aCount, aDst, aSrc, aType);
+    if (aType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        CopyRange(aDst.ptr, aSrc.ptr, aCount);
+}
+
+void STDMETHODCALLTYPE HkCopyDescriptors(ID3D12Device* aSelf, UINT aDstRanges, const D3D12_CPU_DESCRIPTOR_HANDLE* aDsts,
+                                         const UINT* aDstSizes, UINT aSrcRanges, const D3D12_CPU_DESCRIPTOR_HANDLE* aSrcs,
+                                         const UINT* aSrcSizes, D3D12_DESCRIPTOR_HEAP_TYPE aType);
+ORIG(CopyDescriptors);
+void STDMETHODCALLTYPE HkCopyDescriptors(ID3D12Device* aSelf, UINT aDstRanges, const D3D12_CPU_DESCRIPTOR_HANDLE* aDsts,
+                                         const UINT* aDstSizes, UINT aSrcRanges, const D3D12_CPU_DESCRIPTOR_HANDLE* aSrcs,
+                                         const UINT* aSrcSizes, D3D12_DESCRIPTOR_HEAP_TYPE aType)
+{
+    g_CopyDescriptors(aSelf, aDstRanges, aDsts, aDstSizes, aSrcRanges, aSrcs, aSrcSizes, aType);
+    if (aType != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !aDsts || !aSrcs)
+        return;
+    // Walk both range lists in step, one descriptor at a time.
+    UINT di = 0, dOff = 0, si = 0, sOff = 0;
+    while (di < aDstRanges && si < aSrcRanges)
+    {
+        UINT dSize = aDstSizes ? aDstSizes[di] : 1;
+        UINT sSize = aSrcSizes ? aSrcSizes[si] : 1;
+        UINT n = std::min(dSize - dOff, sSize - sOff);
+        CopyRange(aDsts[di].ptr + static_cast<SIZE_T>(dOff) * g_viewStep,
+                  aSrcs[si].ptr + static_cast<SIZE_T>(sOff) * g_viewStep, n);
+        dOff += n;
+        sOff += n;
+        if (dOff >= dSize)
+        {
+            ++di;
+            dOff = 0;
+        }
+        if (sOff >= sSize)
+        {
+            ++si;
+            sOff = 0;
+        }
+    }
+}
+
 // Pipeline library
 HRESULT STDMETHODCALLTYPE HkLoadGraphicsPipeline(ID3D12PipelineLibrary* aSelf, LPCWSTR aName,
                                                  const D3D12_GRAPHICS_PIPELINE_STATE_DESC* aDesc, REFIID aRiid,
@@ -609,7 +868,7 @@ HRESULT STDMETHODCALLTYPE HkReset(List* aSelf, ID3D12CommandAllocator* aAlloc, I
     {
         {
             std::lock_guard lock(g_listMutex);
-            g_lists[aSelf] = ListRecord{{}, true, 0};
+            g_lists[aSelf] = ListRecord{{}, true, 0, nullptr, nullptr};
         }
         if (aPso)
             Add(aSelf, "Reset with " + PsoText(aPso));
@@ -624,6 +883,57 @@ void STDMETHODCALLTYPE HkSetPipelineState(List* aSelf, ID3D12PipelineState* aPso
     if (Capturing())
         Add(aSelf, PsoText(aPso));
     g_SetPipelineState(aSelf, aPso);
+}
+
+void STDMETHODCALLTYPE HkSetComputeRootSignature(List* aSelf, ID3D12RootSignature* aRs);
+ORIG(SetComputeRootSignature);
+void STDMETHODCALLTYPE HkSetComputeRootSignature(List* aSelf, ID3D12RootSignature* aRs)
+{
+    if (Capturing())
+    {
+        std::lock_guard lock(g_listMutex);
+        g_lists[aSelf].csRootSig = aRs;
+    }
+    g_SetComputeRootSignature(aSelf, aRs);
+}
+
+void STDMETHODCALLTYPE HkSetGraphicsRootSignature(List* aSelf, ID3D12RootSignature* aRs);
+ORIG(SetGraphicsRootSignature);
+void STDMETHODCALLTYPE HkSetGraphicsRootSignature(List* aSelf, ID3D12RootSignature* aRs)
+{
+    if (Capturing())
+    {
+        std::lock_guard lock(g_listMutex);
+        g_lists[aSelf].gfxRootSig = aRs;
+    }
+    g_SetGraphicsRootSignature(aSelf, aRs);
+}
+
+void* CurrentRootSig(List* aList, bool aCompute)
+{
+    std::lock_guard lock(g_listMutex);
+    auto it = g_lists.find(aList);
+    if (it == g_lists.end())
+        return nullptr;
+    return aCompute ? it->second.csRootSig : it->second.gfxRootSig;
+}
+
+void STDMETHODCALLTYPE HkSetComputeRootDescriptorTable(List* aSelf, UINT aIndex, D3D12_GPU_DESCRIPTOR_HANDLE aBase);
+ORIG(SetComputeRootDescriptorTable);
+void STDMETHODCALLTYPE HkSetComputeRootDescriptorTable(List* aSelf, UINT aIndex, D3D12_GPU_DESCRIPTOR_HANDLE aBase)
+{
+    if (Capturing())
+        Add(aSelf, "cs " + TableText(CurrentRootSig(aSelf, true), aIndex, aBase));
+    g_SetComputeRootDescriptorTable(aSelf, aIndex, aBase);
+}
+
+void STDMETHODCALLTYPE HkSetGraphicsRootDescriptorTable(List* aSelf, UINT aIndex, D3D12_GPU_DESCRIPTOR_HANDLE aBase);
+ORIG(SetGraphicsRootDescriptorTable);
+void STDMETHODCALLTYPE HkSetGraphicsRootDescriptorTable(List* aSelf, UINT aIndex, D3D12_GPU_DESCRIPTOR_HANDLE aBase)
+{
+    if (Capturing())
+        Add(aSelf, "gfx " + TableText(CurrentRootSig(aSelf, false), aIndex, aBase));
+    g_SetGraphicsRootDescriptorTable(aSelf, aIndex, aBase);
 }
 
 void STDMETHODCALLTYPE HkDrawInstanced(List* aSelf, UINT aVerts, UINT aInst, UINT aStartVert, UINT aStartInst);
@@ -841,6 +1151,23 @@ void InstallHooks(ID3D12Device* aDevice)
 {
     Info("installing hooks on device %p", aDevice);
     g_rtvStep = aDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    g_viewStep = aDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll"))
+        g_deserializer = reinterpret_cast<DeserializerFn>(
+            GetProcAddress(d3d12, "D3D12CreateVersionedRootSignatureDeserializer"));
+    Info("root signature reader %s", g_deserializer ? "found" : "MISSING");
+
+    HookSlot(aDevice, kDevice_CreateDescriptorHeap, &HkCreateDescriptorHeap, &g_CreateDescriptorHeap,
+             "CreateDescriptorHeap");
+    HookSlot(aDevice, kDevice_CreateRootSignature, &HkCreateRootSignature, &g_CreateRootSignature,
+             "CreateRootSignature");
+    HookSlot(aDevice, kDevice_CreateShaderResourceView, &HkCreateShaderResourceView, &g_CreateShaderResourceView,
+             "CreateShaderResourceView");
+    HookSlot(aDevice, kDevice_CreateUnorderedAccessView, &HkCreateUnorderedAccessView, &g_CreateUnorderedAccessView,
+             "CreateUnorderedAccessView");
+    HookSlot(aDevice, kDevice_CopyDescriptors, &HkCopyDescriptors, &g_CopyDescriptors, "CopyDescriptors");
+    HookSlot(aDevice, kDevice_CopyDescriptorsSimple, &HkCopyDescriptorsSimple, &g_CopyDescriptorsSimple,
+             "CopyDescriptorsSimple");
 
     HookSlot(aDevice, kDevice_CreateGraphicsPipelineState, &HkCreateGraphicsPipelineState,
              &g_CreateGraphicsPipelineState, "CreateGraphicsPipelineState");
@@ -892,6 +1219,14 @@ void InstallHooks(ID3D12Device* aDevice)
                  "ClearRenderTargetView");
         HookSlot(list, kList_ClearDepthStencilView, &HkClearDepthStencilView, &g_ClearDepthStencilView,
                  "ClearDepthStencilView");
+        HookSlot(list, kList_SetComputeRootSignature, &HkSetComputeRootSignature, &g_SetComputeRootSignature,
+                 "SetComputeRootSignature");
+        HookSlot(list, kList_SetGraphicsRootSignature, &HkSetGraphicsRootSignature, &g_SetGraphicsRootSignature,
+                 "SetGraphicsRootSignature");
+        HookSlot(list, kList_SetComputeRootDescriptorTable, &HkSetComputeRootDescriptorTable,
+                 &g_SetComputeRootDescriptorTable, "SetComputeRootDescriptorTable");
+        HookSlot(list, kList_SetGraphicsRootDescriptorTable, &HkSetGraphicsRootDescriptorTable,
+                 &g_SetGraphicsRootDescriptorTable, "SetGraphicsRootDescriptorTable");
         HookSlot(list, kList_SetMarker, &HkSetMarker, &g_SetMarker, "SetMarker");
         HookSlot(list, kList_BeginEvent, &HkBeginEvent, &g_BeginEvent, "BeginEvent");
         HookSlot(list, kList_EndEvent, &HkEndEvent, &g_EndEvent, "EndEvent");
@@ -958,7 +1293,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Inspector 0.1.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Inspector 0.2.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -972,7 +1307,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLInspector";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 1, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 2, 0);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
