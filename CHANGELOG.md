@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0
+
+NEW! Ping and scan outlines line up with the zoomed lens: inside the scope they're magnified with the picture, so they sit on the enemy you see. Works for every scope shape and zoom level, and for other mods' scopes that use the game's scope glass.
+
+NEW! "Outline only in the lens" in Mod Settings (on by default): pinged enemies show just their outline through the scope instead of the game's hatched fill.
+
+The mod now includes a small RED4ext plugin for the outlines. RED4ext already comes with Codeware, so nothing new to install. On a game version the plugin doesn't support, the mod works as before.
+
 ## 1.0.0
 
 NEW! Lens zoom levels for 8 scopes, for every skin: one key cycles the lens magnification. Hyakume: vanilla, 1.3×, 1.6×. Grandstand Mk.2x, E255 Percipient, ClearVue Mk.8 and Jue: 1.6×, 2×, 3×. HPO Kanone MAX Mk.77, E305 Prospecta and Gaki: 2×, 3×, 4×.

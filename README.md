@@ -36,9 +36,28 @@ they have no zoom. The list is `tools/scopes.txt`.
   reaches the camera through `ZoomTransition.SendZoomAnimFeatureData`, and after vanilla sends
   it the script sends it again with the weapon zoom at 1×. Kiroshi optics zoom is untouched.
 
+### Ping and scan outlines in the lens
+
+The lens enlarges a copy of the scene, but the game draws ping and scan outlines later, on a
+layer of their own that it lays over the screen together with the HUD. Without help, the
+outlines inside a zoomed lens stay at their unzoomed size and place. The mod's native part
+(`red4ext\plugins\ScopeZoomLevels\ScopeZoomLevels.dll`, a RED4ext plugin) fixes that:
+
+- While you aim at a zoom level, it draws your scope's lens glass a second time into a small
+  mask of its own, so it knows exactly where the lens is on screen, for any scope shape, field
+  of view or aim animation.
+- Right after the game finishes the outline layer, it enlarges the part inside the lens by the
+  lens zoom around the lens centre, so outlines sit on the enemies you see through the scope.
+  By default only the outline itself is kept inside the lens, without the game's hatched fill.
+- Not aiming, it does next to nothing. It only adds its own steps to the frame and puts the
+  game's state back exactly afterwards.
+- It is written for game version 2.5. On any other version RED4ext doesn't load it, and the
+  mod works as before, with vanilla outlines in the lens.
+
 ## Requirements
 
-Codeware, ArchiveXL, TweakXL. Mod Settings is optional.
+Codeware, ArchiveXL, TweakXL, and RED4ext (which Codeware already needs). Mod Settings is
+optional.
 
 ## Controls
 
@@ -52,6 +71,8 @@ their first zoom level when you aim. Change the key in Mod Settings.
 - **No camera zoom when aiming**: on by default; turn off for vanilla camera zoom.
 - **Remember zoom level per weapon**: on by default, each weapon keeps the level you last
   chose. Off: every aim starts at the scope's first level.
+- **Outline only in the lens**: on by default, pinged enemies show just their outline through
+  the scope. Off: the game's filled look (still lined up with the zoom).
 - **Debug logging**: writes what the mod does to the CET game log.
 
 ## For mod authors
@@ -77,6 +98,9 @@ ScopeZoomLevels.my_scope_model.noVanilla: true                 # optional
 `noVanilla` drops the vanilla level while aiming: the scope starts at level 1 and the key
 cycles only its zoom levels. Leave it out to keep vanilla as the first level.
 
+Ping outlines line up in your scope's lens too, with nothing to add, as long as its lens uses
+`base\materials\glass_scope.mt` on the weapon: the native part finds the lens from that glass.
+
 ## Building
 
 Add a scope's model name and its magnifications to `tools/scopes.txt` (with `no-vanilla`
@@ -85,10 +109,17 @@ before the numbers to drop its vanilla level), then run
 meshes, writes the `.xl` and `scopes.yaml`, packs `archive\pc\mod\ScopeZoomLevels.archive`
 and writes `dist\ScopeZoomLevels.zip`. Needs WolvenKit.CLI and Python.
 
+The native part is in `native\` (C++, built against [RED4ext.SDK](https://github.com/wopss/RED4ext.SDK)
+with Visual Studio's CMake; `tools/build.sh` builds it). Its lens mask shader is compiled ahead
+of time to DXIL by `native\tools\make_shaders.py`. `inspector\` holds the diagnostic plugin
+used to find out how the game draws a frame; it isn't part of the release.
+
 ## Credits
 
 Idea inspired by the lens approach in Split Focus OptiX on Nexus Mods. No files from that mod
 are used; everything is built from the game's own files.
+
+The native part is built with RED4ext.SDK by wopss and contributors (MIT).
 
 I built it with Claude (the AI).
 

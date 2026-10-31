@@ -18,6 +18,7 @@ __pycache__/
 inspector/build/
 red4ext/plugins/SZLInspector/
 
-# Outline fix test plugin build scratch and its DLL.
+# Native part build scratch (the DLL itself goes to red4ext\plugins\ScopeZoomLevels and is
+# committed, like the .archive). The old test output folder is kept out.
 native/build/
 red4ext/plugins/SZLOutlineFix/

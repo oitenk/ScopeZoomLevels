@@ -1,4 +1,4 @@
-// Scope Zoom Levels 1.0.0: a key cycles how much the scope lens magnifies.
+// Scope Zoom Levels 1.1.0: a key cycles how much the scope lens magnifies.
 // Each zoom level is an extra mesh appearance on the scope's lens part, named
 // "<skin>_szl<level>". Level 0 is the vanilla appearance.
 //
@@ -273,7 +273,7 @@ public class SZLSystem extends ScriptableSystem {
   }
 }
 
-// Tells the native outline fix (red4ext\plugins\SZLOutlineFix) the lens zoom, so ping outlines
+// Tells the mod's native part (red4ext\plugins\ScopeZoomLevels) the lens zoom, so ping outlines
 // line up with the magnified picture. Looked up by name, so without the plugin (or after a game
 // update it does not support) this does nothing and the mod works as before.
 // outlineOnly: inside the lens, keep just the outline and drop the game's hatched fill.

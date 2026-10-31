@@ -1,4 +1,4 @@
-// SZL Outline Fix - test plugin for Scope Zoom Levels: makes ping outlines line up with the
+// Scope Zoom Levels - native part (a RED4ext plugin): makes ping outlines line up with the
 // magnified picture in a zoomed scope lens.
 //
 // Why: the lens shader enlarges a copy of the scene, but the game draws the ping/scan outlines
@@ -16,7 +16,8 @@
 // a second time into an 8-bit mask of ours, with the game's own vertex shader, so the remap knows
 // exactly where the lens is on screen, for any scope, field of view or aim animation.
 //
-// Control (for now from the CET console):
+// The mod's script switches it on while aiming at a zoom level (SZL_OutlineLens) and sets the
+// style (SZL_OutlineStyle). For testing, from the CET console:
 //   Game.SZL_OutlineLens(true, 3.0)          on, with the lens zoom value; false to switch off
 //   Game.SZL_OutlineTune(0.45, 0.45, 1.0)    outer limit x / y of the lens search (share of screen height), and a
 //                                            factor: magnification = zoom value * factor
@@ -1453,7 +1454,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Outline Fix 0.4.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("Scope Zoom Levels 1.1.0 native part loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -1465,9 +1466,9 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
 
 RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
-    aInfo->name = L"SZLOutlineFix";
+    aInfo->name = L"ScopeZoomLevels";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 4, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(1, 1, 0);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
