@@ -13,3 +13,7 @@ promo/
 
 # Python bytecode from the build tools.
 __pycache__/
+
+# Diagnostic inspector plugin build scratch and its DLL.
+inspector/build/
+red4ext/plugins/SZLInspector/
