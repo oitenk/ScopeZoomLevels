@@ -17,6 +17,8 @@
 //   Game.SZL_OutlineTune(0.31, 0.31, 1.0)    lens radius x / y (share of screen height), and a
 //                                            factor: magnification = zoom value * factor
 //   Game.SZL_OutlineCenter(0.5, 0.5)         lens centre (share of screen width / height)
+//   Game.SZL_OutlineStyle(true, 0.9)         outline only (drop the fill) inside the lens, and the
+//                                            opacity a texel needs to count as outline; false = vanilla
 
 #include <RED4ext/RED4ext.hpp>
 
@@ -80,6 +82,8 @@ struct Lens
     float factor = 1.f;    // magnification = zoom * factor
     float centerX = 0.5f;  // share of screen width / height
     float centerY = 0.5f;
+    bool outlineOnly = true;
+    float cutoff = 0.9f;   // opacity a texel needs to count as outline
 };
 std::mutex g_lensMutex;
 Lens g_lens;
@@ -190,16 +194,22 @@ cbuffer P : register(b0)
 {
     uint bw; uint bh; uint pitch; uint pad0;
     float cx; float cy; float rx; float ry;
-    float invM; float pad1; float pad2; float pad3;
+    float invM; float cutoff; float pad2; float pad3;
 };
 ByteAddressBuffer Src : register(t0);
 RWByteAddressBuffer Dst : register(u0);
 
+// cutoff > 0: outline only. The game's layer holds a solid outline (fully opaque) around a
+// hatched, half-transparent fill and a faint trailing pattern; keeping only the texels at or
+// above the cutoff keeps the outline and drops the rest.
 float4 Texel(int2 p)
 {
     p = clamp(p, int2(0, 0), int2(bw - 1, bh - 1));
     uint v = Src.Load(p.y * pitch + p.x * 4);
-    return float4(v & 255, (v >> 8) & 255, (v >> 16) & 255, v >> 24) / 255.0;
+    float4 c = float4(v & 255, (v >> 8) & 255, (v >> 16) & 255, v >> 24) / 255.0;
+    if (cutoff > 0.0 && c.a < cutoff)
+        return 0;
+    return c;
 }
 
 [numthreads(8, 8, 1)]
@@ -494,8 +504,8 @@ void AfterOverlay(List* aList)
     struct
     {
         UINT bw, bh, pitch, pad0;
-        float cx, cy, rx, ry, invM, pad1, pad2, pad3;
-    } c{bw, bh, pitch, 0, cx - x0, cy - y0, rx, ry, 1.f / m, 0, 0, 0};
+        float cx, cy, rx, ry, invM, cutoff, pad2, pad3;
+    } c{bw, bh, pitch, 0, cx - x0, cy - y0, rx, ry, 1.f / m, lens.outlineOnly ? lens.cutoff : 0.f, 0, 0};
     g_SetComputeRootSignature(aList, g_ourRootSig);
     g_SetPipelineState(aList, g_ourPso);
     g_SetComputeRoot32BitConstants(aList, 0, 12, &c, 0);
@@ -907,6 +917,19 @@ void OutlineCenter(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, i
     Info("centre %.3f, %.3f", x, y);
 }
 
+void OutlineStyle(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t)
+{
+    bool outlineOnly = true;
+    float cutoff = 0.9f;
+    RED4ext::GetParameter(aFrame, &outlineOnly);
+    RED4ext::GetParameter(aFrame, &cutoff);
+    aFrame->code++;
+    std::lock_guard lock(g_lensMutex);
+    g_lens.outlineOnly = outlineOnly;
+    g_lens.cutoff = std::clamp(cutoff, 0.01f, 1.f);
+    Info("style: %s, cutoff %.2f", outlineOnly ? "outline only" : "vanilla (fill)", g_lens.cutoff);
+}
+
 void RegisterTypes()
 {
 }
@@ -928,6 +951,13 @@ void PostRegisterTypes()
         f->AddParam("Float", "radiusX");
         f->AddParam("Float", "radiusY");
         f->AddParam("Float", "factor");
+        rtti->RegisterFunction(f);
+    }
+    {
+        auto f = RED4ext::CGlobalFunction::Create("SZL_OutlineStyle", "SZL_OutlineStyle", &OutlineStyle);
+        f->flags = flags;
+        f->AddParam("Bool", "outlineOnly");
+        f->AddParam("Float", "cutoff");
         rtti->RegisterFunction(f);
     }
     {
@@ -955,7 +985,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Outline Fix 0.1.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Outline Fix 0.2.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -969,7 +999,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLOutlineFix";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 1, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 2, 0);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
