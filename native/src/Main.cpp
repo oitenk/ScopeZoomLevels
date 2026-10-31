@@ -1063,7 +1063,8 @@ void STDMETHODCALLTYPE HkOMSetRenderTargets(List* aSelf, UINT aCount, const D3D1
 }
 
 // After a scope glass draw: the same draw again with the twin pipeline into our lens mask, then
-// the game's render targets and pipeline are put back. Returns false if it could not.
+// the game's render targets and pipeline are put back. Does nothing when the lens fix is off or
+// the draw's targets are unknown.
 template<typename Redraw>
 void LensMaskDraw(List* aList, Redraw aRedraw)
 {
