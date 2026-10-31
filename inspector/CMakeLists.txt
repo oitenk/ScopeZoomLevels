@@ -2,7 +2,7 @@
 
 project(
   SZLInspector
-  VERSION 0.3.0
+  VERSION 0.4.0
   DESCRIPTION "Diagnostic RED4ext plugin: logs how the game draws one frame (for the scope outline fix)"
   LANGUAGES C CXX
 )

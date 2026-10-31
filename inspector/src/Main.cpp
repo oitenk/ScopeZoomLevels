@@ -450,7 +450,9 @@ bool g_dumpTaken = false;
 std::vector<Dump> g_submittedDumps; // under g_listMutex
 // The compute shader that finishes the gameplay overlay layer (outlines etc.), found in the
 // 0.2 captures: images are saved right after its dispatch.
-constexpr const char* DumpAfterShader = "cs=c78f229d71c24f5d";
+// 0.4: the step that reads the highlight mask (R8) and its depth/stencil, to see whether that
+// mask is the scope lens. 0.3 used "cs=c78f229d71c24f5d" (the step that finishes the layer).
+constexpr const char* DumpAfterShader = "cs=e7e8fdf2b06026e0";
 
 std::mutex g_listMutex;
 std::unordered_map<void*, ListRecord> g_lists;
@@ -1522,7 +1524,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Inspector 0.3.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Inspector 0.4.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -1536,7 +1538,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLInspector";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 4, 0);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
