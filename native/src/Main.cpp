@@ -1,4 +1,4 @@
-// SZL Outline Fix - test plugin for Scope Zoom Levels: makes ping outlines line up with the
+﻿// SZL Outline Fix - test plugin for Scope Zoom Levels: makes ping outlines line up with the
 // magnified picture in a zoomed scope lens.
 //
 // Why: the lens shader enlarges a copy of the scene, but the game draws the ping/scan outlines
@@ -44,6 +44,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "LensMaskDxil.h"
 #include "Vtbl.h"
 
 namespace
@@ -109,6 +110,25 @@ uint64_t Fnv1a(const void* aData, size_t aSize)
         h *= 1099511628211ull;
     }
     return h;
+}
+
+// True if a compiled shader's container (DXBC header: magic, hash, version, size, part count,
+// part offsets; each part starts with its four-character code) has the given part.
+bool HasShaderPart(const D3D12_SHADER_BYTECODE& aCode, const char (&aFourCC)[5])
+{
+    auto* p = static_cast<const uint8_t*>(aCode.pShaderBytecode);
+    if (!p || aCode.BytecodeLength < 32 || memcmp(p, "DXBC", 4) != 0)
+        return false;
+    uint32_t count;
+    memcpy(&count, p + 28, 4);
+    for (uint32_t i = 0; i < count && 32 + 4 * (i + 1) <= aCode.BytecodeLength; ++i)
+    {
+        uint32_t offset;
+        memcpy(&offset, p + 32 + 4 * i, 4);
+        if (offset + 4 <= aCode.BytecodeLength && memcmp(p + offset, aFourCC, 4) == 0)
+            return true;
+    }
+    return false;
 }
 
 std::shared_mutex g_psoMutex;
@@ -216,7 +236,7 @@ ByteAddressBuffer Mask : register(t1); // the lens glass as drawn this frame (8-
 bool InLens(float2 gp)
 {
     if (maskOn == 0)
-        return false;
+        return true; // no mask (fallback): the circle alone decides
     int2 m = int2(floor(gp * float2(msx, msy))) - int2(mbx, mby);
     if (m.x < 0 || m.y < 0 || m.x >= int(mbw) || m.y >= int(mbh))
         return false;
@@ -598,11 +618,17 @@ void AfterOverlay(List* aList)
     float m = lens.zoom * lens.factor;
     if (!lens.active || m <= 1.001f || !g_ready)
         return;
+    // Only where scope glass was drawn this frame. If no glass twin could be made at all, fall
+    // back to a fixed circle (the 0.2 behaviour) rather than no fix.
     {
-        // Only where scope glass was drawn: no glass, nothing to magnify.
         std::lock_guard lock(g_maskMutex);
         if (!g_mask || !g_maskDrawn)
-            return;
+        {
+            std::shared_lock twins(g_lensPsoMutex);
+            if (!g_lensPsos.empty())
+                return;
+            lens.radiusX = lens.radiusY = 0.31f;
+        }
     }
 
     ListState s;
@@ -773,7 +799,10 @@ HRESULT STDMETHODCALLTYPE HkCreateGraphicsPipelineState(ID3D12Device* aSelf, con
         // The twin: the game's root signature, vertex shader, input layout and rasterizer, with
         // our pixel shader writing 1 into a single 8-bit target, no blending, no depth.
         D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *aDesc;
-        d.PS = {g_maskPs->GetBufferPointer(), g_maskPs->GetBufferSize()};
+        // One pipeline can't mix shader formats: match the game's vertex shader (DXIL or DXBC).
+        bool dxil = HasShaderPart(aDesc->VS, "DXIL");
+        d.PS = dxil ? D3D12_SHADER_BYTECODE{kLensMaskDxil, sizeof(kLensMaskDxil)}
+                    : D3D12_SHADER_BYTECODE{g_maskPs->GetBufferPointer(), g_maskPs->GetBufferSize()};
         d.StreamOutput = {};
         d.BlendState = {};
         d.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
@@ -785,7 +814,23 @@ HRESULT STDMETHODCALLTYPE HkCreateGraphicsPipelineState(ID3D12Device* aSelf, con
         d.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
         d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         d.SampleMask = UINT_MAX;
+        // Depth and stencil off, but every field still a valid value (zero is not a valid
+        // comparison function or stencil operation).
         d.DepthStencilState = {};
+        d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        d.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+        d.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+        for (auto* face : {&d.DepthStencilState.FrontFace, &d.DepthStencilState.BackFace})
+        {
+            face->StencilFailOp = D3D12_STENCIL_OP_KEEP;
+            face->StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+            face->StencilPassOp = D3D12_STENCIL_OP_KEEP;
+            face->StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        }
+        // Unused blend slots also get valid values.
+        for (UINT i = 1; i < 8; ++i)
+            d.BlendState.RenderTarget[i] = d.BlendState.RenderTarget[0];
         d.NumRenderTargets = 1;
         for (auto& f : d.RTVFormats)
             f = DXGI_FORMAT_UNKNOWN;
@@ -797,14 +842,17 @@ HRESULT STDMETHODCALLTYPE HkCreateGraphicsPipelineState(ID3D12Device* aSelf, con
         ID3D12PipelineState* twin = nullptr;
         ID3D12PipelineState* game = nullptr;
         static_cast<IUnknown*>(*aOut)->QueryInterface(IID_PPV_ARGS(&game));
-        if (game && SUCCEEDED(g_CreateGraphicsPipelineState(aSelf, &d, IID_PPV_ARGS(&twin))))
+        HRESULT th = game ? g_CreateGraphicsPipelineState(aSelf, &d, IID_PPV_ARGS(&twin)) : E_NOINTERFACE;
+        if (SUCCEEDED(th))
         {
             std::unique_lock lock(g_lensPsoMutex);
             g_lensPsos[game] = twin;
-            Info("scope glass pipeline %p: lens mask twin ready", game);
+            Info("scope glass pipeline %p: lens mask twin ready (%s)", game, dxil ? "DXIL" : "DXBC");
         }
         else
-            Info("scope glass pipeline %p: lens mask twin FAILED", game);
+            Info("scope glass pipeline %p: lens mask twin FAILED, error 0x%08x (%s, %u input elements, topology %d)",
+                 game, static_cast<unsigned>(th), dxil ? "DXIL" : "DXBC", aDesc->InputLayout.NumElements,
+                 aDesc->PrimitiveTopologyType);
         if (game)
             game->Release();
     }
@@ -1347,7 +1395,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Outline Fix 0.3.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Outline Fix 0.3.1 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -1361,7 +1409,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLOutlineFix";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 1);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
