@@ -1,4 +1,4 @@
-// SZL Inspector - a diagnostic RED4ext plugin for the Scope Zoom Levels outline fix.
+﻿// SZL Inspector - a diagnostic RED4ext plugin for the Scope Zoom Levels outline fix.
 //
 // It logs how the game draws a frame, from the inside, because frame capture tools can't see this
 // game's D3D12 device (NVIDIA Streamline sits in between). Press Ctrl+F11 in game: the next two
@@ -19,6 +19,7 @@
 #include <Windows.h>
 #include <d3d12.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -422,6 +423,14 @@ enum State : int
 };
 std::atomic<int> g_state{Idle};
 
+struct Dump
+{
+    ID3D12Resource* readback = nullptr;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT rows = 0;
+    std::string name;
+};
+
 struct ListRecord
 {
     std::vector<std::string> lines;
@@ -429,7 +438,19 @@ struct ListRecord
     int depth = 0;
     void* gfxRootSig = nullptr;
     void* csRootSig = nullptr;
+    void* pso = nullptr;
+    std::unordered_map<UINT, UINT64> csTables;                         // root index -> GPU handle
+    std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> states; // from this list's barriers
+    std::vector<Dump> dumps;
 };
+
+ID3D12Device* g_device = nullptr;
+std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> g_lastState; // any list, under g_listMutex
+bool g_dumpTaken = false;
+std::vector<Dump> g_submittedDumps; // under g_listMutex
+// The compute shader that finishes the gameplay overlay layer (outlines etc.), found in the
+// 0.2 captures: images are saved right after its dispatch.
+constexpr const char* DumpAfterShader = "cs=c78f229d71c24f5d";
 
 std::mutex g_listMutex;
 std::unordered_map<void*, ListRecord> g_lists;
@@ -558,6 +579,8 @@ void OnSubmit(ID3D12CommandQueue* aQueue, UINT aCount, ID3D12CommandList* const*
         g_lists.clear();
         g_out.clear();
         g_submitCount = 0;
+        g_lastState.clear();
+        g_dumpTaken = false;
         g_armFrame = frame;
         g_state = Armed;
         Info("capture armed at frame %llu", static_cast<unsigned long long>(frame));
@@ -600,6 +623,8 @@ void OnSubmit(ID3D12CommandQueue* aQueue, UINT aCount, ID3D12CommandList* const*
             {
                 for (auto& line : it->second.lines)
                     g_out.push_back(std::move(line));
+                for (auto& d : it->second.dumps)
+                    g_submittedDumps.push_back(d);
                 g_lists.erase(it);
             }
         }
@@ -851,10 +876,61 @@ HRESULT STDMETHODCALLTYPE HkLoadPipeline(ID3D12PipelineLibrary1* aSelf, LPCWSTR 
 // Queue
 void STDMETHODCALLTYPE HkExecuteCommandLists(ID3D12CommandQueue* aSelf, UINT aCount, ID3D12CommandList* const* aLists);
 ORIG(ExecuteCommandLists);
+void WriteDumps(std::vector<Dump> aDumps, ID3D12Fence* aFence, UINT64 aValue)
+{
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (aFence->GetCompletedValue() < aValue && SUCCEEDED(aFence->SetEventOnCompletion(aValue, ev)))
+        WaitForSingleObject(ev, 10000);
+    CloseHandle(ev);
+    if (aFence->GetCompletedValue() < aValue)
+    {
+        Info("image dump: GPU did not finish in time, nothing saved");
+        return;
+    }
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    char stamp[32];
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
+    auto folder = LogsFolder() / (std::string("szl-dump-") + stamp);
+    std::filesystem::create_directories(folder);
+    for (auto& d : aDumps)
+    {
+        void* data = nullptr;
+        D3D12_RANGE range{0, static_cast<SIZE_T>(d.footprint.Footprint.RowPitch) * d.rows};
+        if (SUCCEEDED(d.readback->Map(0, &range, &data)))
+        {
+            auto& f = d.footprint.Footprint;
+            auto path = folder / (d.name + Fmt("_%ux%u_f%d_pitch%u.bin", f.Width, f.Height, f.Format, f.RowPitch));
+            std::ofstream out(path, std::ios::binary);
+            out.write(static_cast<const char*>(data), static_cast<std::streamsize>(range.End));
+            D3D12_RANGE none{0, 0};
+            d.readback->Unmap(0, &none);
+        }
+        d.readback->Release();
+    }
+    Info("image dump: %zu images saved to %s", aDumps.size(), folder.string().c_str());
+}
+
 void STDMETHODCALLTYPE HkExecuteCommandLists(ID3D12CommandQueue* aSelf, UINT aCount, ID3D12CommandList* const* aLists)
 {
     OnSubmit(aSelf, aCount, aLists);
     g_ExecuteCommandLists(aSelf, aCount, aLists);
+
+    std::vector<Dump> dumps;
+    {
+        std::lock_guard lock(g_listMutex);
+        dumps.swap(g_submittedDumps);
+    }
+    if (!dumps.empty() && g_device)
+    {
+        static ID3D12Fence* fence = nullptr;
+        static UINT64 value = 0;
+        if (!fence && FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
+            return;
+        aSelf->Signal(fence, ++value);
+        std::thread(WriteDumps, std::move(dumps), fence, value).detach();
+    }
 }
 
 // Command list
@@ -868,7 +944,9 @@ HRESULT STDMETHODCALLTYPE HkReset(List* aSelf, ID3D12CommandAllocator* aAlloc, I
     {
         {
             std::lock_guard lock(g_listMutex);
-            g_lists[aSelf] = ListRecord{{}, true, 0, nullptr, nullptr};
+            ListRecord rec;
+            rec.fromReset = true;
+            g_lists[aSelf] = std::move(rec);
         }
         if (aPso)
             Add(aSelf, "Reset with " + PsoText(aPso));
@@ -881,7 +959,11 @@ ORIG(SetPipelineState);
 void STDMETHODCALLTYPE HkSetPipelineState(List* aSelf, ID3D12PipelineState* aPso)
 {
     if (Capturing())
+    {
         Add(aSelf, PsoText(aPso));
+        std::lock_guard lock(g_listMutex);
+        g_lists[aSelf].pso = aPso;
+    }
     g_SetPipelineState(aSelf, aPso);
 }
 
@@ -892,7 +974,9 @@ void STDMETHODCALLTYPE HkSetComputeRootSignature(List* aSelf, ID3D12RootSignatur
     if (Capturing())
     {
         std::lock_guard lock(g_listMutex);
-        g_lists[aSelf].csRootSig = aRs;
+        auto& rec = g_lists[aSelf];
+        rec.csRootSig = aRs;
+        rec.csTables.clear();
     }
     g_SetComputeRootSignature(aSelf, aRs);
 }
@@ -923,7 +1007,11 @@ ORIG(SetComputeRootDescriptorTable);
 void STDMETHODCALLTYPE HkSetComputeRootDescriptorTable(List* aSelf, UINT aIndex, D3D12_GPU_DESCRIPTOR_HANDLE aBase)
 {
     if (Capturing())
+    {
         Add(aSelf, "cs " + TableText(CurrentRootSig(aSelf, true), aIndex, aBase));
+        std::lock_guard lock(g_listMutex);
+        g_lists[aSelf].csTables[aIndex] = aBase.ptr;
+    }
     g_SetComputeRootDescriptorTable(aSelf, aIndex, aBase);
 }
 
@@ -958,11 +1046,15 @@ void STDMETHODCALLTYPE HkDrawIndexedInstanced(List* aSelf, UINT aIdx, UINT aInst
 
 void STDMETHODCALLTYPE HkDispatch(List* aSelf, UINT aX, UINT aY, UINT aZ);
 ORIG(Dispatch);
+void DumpCheck(List* aList);
+
 void STDMETHODCALLTYPE HkDispatch(List* aSelf, UINT aX, UINT aY, UINT aZ)
 {
     if (Capturing())
         Add(aSelf, Fmt("Dispatch %u x %u x %u", aX, aY, aZ));
     g_Dispatch(aSelf, aX, aY, aZ);
+    if (g_state == Recording)
+        DumpCheck(aSelf);
 }
 
 void STDMETHODCALLTYPE HkExecuteIndirect(List* aSelf, ID3D12CommandSignature* aSig, UINT aMax, ID3D12Resource* aArgs,
@@ -1032,8 +1124,13 @@ void STDMETHODCALLTYPE HkResourceBarrier(List* aSelf, UINT aCount, const D3D12_R
         {
             const auto& b = aBarriers[i];
             if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+            {
                 Add(aSelf, "Barrier " + ResourceText(b.Transition.pResource) + " " +
                                StateText(b.Transition.StateBefore) + " -> " + StateText(b.Transition.StateAfter));
+                std::lock_guard lock(g_listMutex);
+                g_lists[aSelf].states[b.Transition.pResource] = b.Transition.StateAfter;
+                g_lastState[b.Transition.pResource] = b.Transition.StateAfter;
+            }
             else
                 ++other;
         }
@@ -1041,6 +1138,136 @@ void STDMETHODCALLTYPE HkResourceBarrier(List* aSelf, UINT aCount, const D3D12_R
             Add(aSelf, Fmt("Barrier x%u (uav/aliasing)", other));
     }
     g_ResourceBarrier(aSelf, aCount, aBarriers);
+}
+
+// Image dump: after the overlay shader's dispatch, copy every large 2D texture its compute
+// tables point at into readback buffers (each plane separately, so depth and stencil both).
+std::vector<ID3D12Resource*> TableResources(void* aRootSig, UINT aIndex, UINT64 aBase)
+{
+    std::vector<ID3D12Resource*> out;
+    SIZE_T cpu = 0;
+    {
+        std::shared_lock lock(g_heapMutex);
+        for (auto& h : g_heaps)
+            if (aBase >= h.gpu && aBase < h.gpu + static_cast<UINT64>(h.count) * g_viewStep)
+                cpu = h.cpu + static_cast<SIZE_T>(aBase - h.gpu);
+    }
+    if (!cpu)
+        return out;
+    std::vector<TableEntry> entries;
+    {
+        std::shared_lock lock(g_rsMutex);
+        auto it = g_rootSigs.find(aRootSig);
+        if (it != g_rootSigs.end() && aIndex < it->second.tables.size())
+            entries = it->second.tables[aIndex];
+    }
+    std::shared_lock lock(g_descMutex);
+    for (auto& e : entries)
+    {
+        if (e.kind != 'S' && e.kind != 'U')
+            continue;
+        auto it = g_descs.find(cpu + static_cast<SIZE_T>(e.offset) * g_viewStep);
+        if (it != g_descs.end() && it->second.resource)
+            out.push_back(it->second.resource);
+    }
+    return out;
+}
+
+void DumpCheck(List* aList)
+{
+    void* pso = nullptr;
+    void* rootSig = nullptr;
+    std::unordered_map<UINT, UINT64> tables;
+    {
+        std::lock_guard lock(g_listMutex);
+        if (g_dumpTaken)
+            return;
+        auto it = g_lists.find(aList);
+        if (it == g_lists.end())
+            return;
+        pso = it->second.pso;
+        rootSig = it->second.csRootSig;
+        tables = it->second.csTables;
+    }
+    {
+        std::shared_lock lock(g_psoMutex);
+        auto it = g_psos.find(pso);
+        if (it == g_psos.end() || it->second.text.find(DumpAfterShader) == std::string::npos)
+            return;
+    }
+    std::vector<ID3D12Resource*> resources;
+    for (auto& [index, base] : tables)
+        for (auto* r : TableResources(rootSig, index, base))
+            if (std::find(resources.begin(), resources.end(), r) == resources.end())
+                resources.push_back(r);
+
+    std::lock_guard lock(g_listMutex);
+    g_dumpTaken = true;
+    auto& rec = g_lists[aList];
+    int n = 0;
+    for (auto* res : resources)
+    {
+        D3D12_RESOURCE_DESC desc = res->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width < 1280)
+            continue;
+        D3D12_RESOURCE_STATES state;
+        if (auto s = rec.states.find(res); s != rec.states.end())
+            state = s->second;
+        else if (auto g = g_lastState.find(res); g != g_lastState.end())
+            state = g->second;
+        else
+        {
+            rec.lines.push_back("DUMP skipped (state unknown) " + ShortRes(res));
+            continue;
+        }
+        D3D12_FEATURE_DATA_FORMAT_INFO fi{desc.Format, 1};
+        if (FAILED(g_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &fi, sizeof(fi))) || fi.PlaneCount == 0)
+            fi.PlaneCount = 1;
+
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = state;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        bool needBarrier = state != D3D12_RESOURCE_STATE_COPY_SOURCE;
+        if (needBarrier)
+            g_ResourceBarrier(aList, 1, &b);
+
+        for (UINT plane = 0; plane < fi.PlaneCount; ++plane)
+        {
+            UINT sub = plane * desc.MipLevels * desc.DepthOrArraySize;
+            Dump d;
+            UINT64 rowSize = 0, total = 0;
+            g_device->GetCopyableFootprints(&desc, sub, 1, 0, &d.footprint, &d.rows, &rowSize, &total);
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = total;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                         nullptr, IID_PPV_ARGS(&d.readback))))
+                continue;
+            D3D12_TEXTURE_COPY_LOCATION dst{d.readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            dst.PlacedFootprint = d.footprint;
+            D3D12_TEXTURE_COPY_LOCATION src{res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            src.SubresourceIndex = sub;
+            g_CopyTextureRegion(aList, &dst, 0, 0, 0, &src, nullptr);
+            d.name = Fmt("%02d_%p_p%u_state%x", n, res, plane, static_cast<unsigned>(state));
+            rec.dumps.push_back(d);
+        }
+        if (needBarrier)
+        {
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            g_ResourceBarrier(aList, 1, &b);
+        }
+        rec.lines.push_back("DUMP " + ShortRes(res) + Fmt(" (%u planes, state 0x%x)", fi.PlaneCount, state));
+        ++n;
+    }
 }
 
 void STDMETHODCALLTYPE HkOMSetRenderTargets(List* aSelf, UINT aCount, const D3D12_CPU_DESCRIPTOR_HANDLE* aRts,
@@ -1150,6 +1377,8 @@ std::atomic<bool> g_installed{false};
 void InstallHooks(ID3D12Device* aDevice)
 {
     Info("installing hooks on device %p", aDevice);
+    g_device = aDevice;
+    g_device->AddRef();
     g_rtvStep = aDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     g_viewStep = aDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll"))
@@ -1293,7 +1522,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Inspector 0.2.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Inspector 0.3.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -1307,7 +1536,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLInspector";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 2, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 0);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
