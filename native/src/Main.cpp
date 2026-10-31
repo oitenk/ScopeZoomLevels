@@ -1464,9 +1464,11 @@ void OutlineStyle(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, in
     RED4ext::GetParameter(aFrame, &cutoff);
     aFrame->code++;
     std::lock_guard lock(g_lensMutex);
+    cutoff = std::clamp(cutoff, 0.01f, 1.f);
+    if (g_lens.outlineOnly != outlineOnly || g_lens.cutoff != cutoff)
+        Info("style: %s, cutoff %.2f", outlineOnly ? "outline only" : "vanilla (fill)", cutoff);
     g_lens.outlineOnly = outlineOnly;
-    g_lens.cutoff = std::clamp(cutoff, 0.01f, 1.f);
-    Info("style: %s, cutoff %.2f", outlineOnly ? "outline only" : "vanilla (fill)", g_lens.cutoff);
+    g_lens.cutoff = cutoff;
 }
 
 void OutlineDebug(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t)
@@ -1540,7 +1542,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Outline Fix 0.3.4 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Outline Fix 0.3.5 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -1554,7 +1556,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLOutlineFix";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 4);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 5);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

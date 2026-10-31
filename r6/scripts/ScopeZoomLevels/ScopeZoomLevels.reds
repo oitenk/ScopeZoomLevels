@@ -52,6 +52,18 @@ public class SZLSettings {
   public let rememberLevel: Bool = true;
 
   @runtimeProperty("ModSettings.mod", "Scope Zoom Levels")
+  @runtimeProperty("ModSettings.category", "Outlines")
+  @runtimeProperty("ModSettings.displayName", "Line up outlines in the lens")
+  @runtimeProperty("ModSettings.description", "Ping and scan outlines are magnified with the lens, so they sit on the enemy you see through the scope.")
+  public let outlineFix: Bool = true;
+
+  @runtimeProperty("ModSettings.mod", "Scope Zoom Levels")
+  @runtimeProperty("ModSettings.category", "Outlines")
+  @runtimeProperty("ModSettings.displayName", "Outline only in the lens")
+  @runtimeProperty("ModSettings.description", "On: pinged enemies show just their outline through the scope. Off: the game's filled look.")
+  public let outlineOnly: Bool = true;
+
+  @runtimeProperty("ModSettings.mod", "Scope Zoom Levels")
   @runtimeProperty("ModSettings.category", "Debug")
   @runtimeProperty("ModSettings.displayName", "Debug logging")
   public let debugLog: Bool = false;
@@ -144,7 +156,7 @@ public class SZLSystem extends ScriptableSystem {
   private func Apply(advance: Bool) -> Void {
     let lens: ref<SZLLens> = this.FindLens(advance);
     if !IsDefined(lens) {
-      SZL_SetOutlineLens(false, 1.0);
+      SZL_SetOutlineLens(false, 1.0, this.m_settings.outlineOnly);
       return;
     }
     let last: Int32 = ArraySize(lens.levels);      // level 0 is vanilla
@@ -156,7 +168,8 @@ public class SZLSystem extends ScriptableSystem {
       this.SetLevel(weaponID, level);
     }
     if !this.IsAiming() { level = 0; }
-    SZL_SetOutlineLens(level > 0, level > 0 ? lens.levels[level - 1] : 1.0);
+    SZL_SetOutlineLens(level > 0 && this.m_settings.outlineFix, level > 0 ? lens.levels[level - 1] : 1.0,
+      this.m_settings.outlineOnly);
     let zoom: String = level > 0 ? FloatToStringPrec(lens.levels[level - 1], 2) + "x" : "vanilla";
     let switched: array<CName>;
     for part in lens.parts {
@@ -270,11 +283,15 @@ public class SZLSystem extends ScriptableSystem {
 // Tells the native outline fix (red4ext\plugins\SZLOutlineFix) the lens zoom, so ping outlines
 // line up with the magnified picture. Looked up by name, so without the plugin (or after a game
 // update it does not support) this does nothing and the mod works as before.
-func SZL_SetOutlineLens(active: Bool, zoom: Float) -> Void {
-  let fn: ref<ReflectionStaticFunc> = Reflection.GetGlobalFunction(n"SZL_OutlineLens");
-  if IsDefined(fn) {
-    fn.Call([ToVariant(active), ToVariant(zoom)]);
+// outlineOnly: inside the lens, keep just the outline and drop the game's hatched fill.
+func SZL_SetOutlineLens(active: Bool, zoom: Float, outlineOnly: Bool) -> Void {
+  let lens: ref<ReflectionStaticFunc> = Reflection.GetGlobalFunction(n"SZL_OutlineLens");
+  if !IsDefined(lens) { return; }
+  let style: ref<ReflectionStaticFunc> = Reflection.GetGlobalFunction(n"SZL_OutlineStyle");
+  if IsDefined(style) {
+    style.Call([ToVariant(outlineOnly), ToVariant(0.9)]);
   }
+  lens.Call([ToVariant(active), ToVariant(zoom)]);
 }
 
 func SZL_NoAimZoom(game: GameInstance) -> Bool {
