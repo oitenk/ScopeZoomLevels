@@ -1212,14 +1212,21 @@ void DumpCheck(List* aList)
         D3D12_RESOURCE_DESC desc = res->GetDesc();
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width < 1280)
             continue;
+        // 0.4.1: single-plane colour images only, and only with a state this list itself set.
+        // 0.4.0 crashed the game here, most likely on a depth/stencil image whose state was a guess.
+        D3D12_FEATURE_DATA_FORMAT_INFO planes{desc.Format, 1};
+        if (SUCCEEDED(g_device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &planes, sizeof(planes))) &&
+            planes.PlaneCount > 1)
+        {
+            rec.lines.push_back("DUMP skipped (depth/stencil) " + ShortRes(res));
+            continue;
+        }
         D3D12_RESOURCE_STATES state;
         if (auto s = rec.states.find(res); s != rec.states.end())
             state = s->second;
-        else if (auto g = g_lastState.find(res); g != g_lastState.end())
-            state = g->second;
         else
         {
-            rec.lines.push_back("DUMP skipped (state unknown) " + ShortRes(res));
+            rec.lines.push_back("DUMP skipped (state not set in this list) " + ShortRes(res));
             continue;
         }
         D3D12_FEATURE_DATA_FORMAT_INFO fi{desc.Format, 1};
@@ -1524,7 +1531,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Inspector 0.4.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Inspector 0.4.1 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -1538,7 +1545,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLInspector";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 4, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 4, 1);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
