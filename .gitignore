@@ -17,3 +17,7 @@ __pycache__/
 # Diagnostic inspector plugin build scratch and its DLL.
 inspector/build/
 red4ext/plugins/SZLInspector/
+
+# Outline fix test plugin build scratch and its DLL.
+native/build/
+red4ext/plugins/SZLOutlineFix/
