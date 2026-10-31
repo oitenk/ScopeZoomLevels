@@ -2,7 +2,7 @@
 
 project(
   SZLOutlineFix
-  VERSION 0.3.2
+  VERSION 0.3.4
   DESCRIPTION "Test plugin: magnifies the ping outline layer inside the scope lens"
   LANGUAGES C CXX
 )

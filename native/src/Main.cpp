@@ -302,10 +302,12 @@ float4 main() : SV_Target
 }
 )";
 
-// Pixel shader of the game's scope glass (base\materials\glass_scope.mt) in the transparent pass,
-// FNV-1a of its bytecode, game 2.5. Seen with and without DLSS; any scope using that material
-// (modded ones too) draws with it.
-constexpr uint64_t LensGlassShaderHash = 0x3270f6703ad3bf1full;
+// Pixel shader of the game's scope glass (base\materials\glass_scope.mt) for SKINNED meshes, the
+// variant a scope fitted to the player's weapon draws with (weapon parts are skinned; modded
+// scopes too). FNV-1a of its bytecode, game 2.5; one 72-index draw per frame, with and without
+// DLSS. The static-mesh variant (0x3270f6703ad3bf1f) is scope glass out in the world and must not
+// be used: 0.3.2's mask held only distant world glass, never the player's lens.
+constexpr uint64_t LensGlassShaderHash = 0x649567eb5a039a01ull;
 
 ID3D12Device* g_device = nullptr;
 ID3D12RootSignature* g_ourRootSig = nullptr;
@@ -1538,7 +1540,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Outline Fix 0.3.3 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Outline Fix 0.3.4 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -1552,7 +1554,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLOutlineFix";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 3);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 4);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
