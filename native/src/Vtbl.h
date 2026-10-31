@@ -5,6 +5,8 @@ extern "C" {
 #endif
 
 extern const int kDevice_CreateComputePipelineState;
+extern const int kDevice_CreateGraphicsPipelineState;
+extern const int kDevice_CreateRenderTargetView;
 extern const int kDevice_CreateDescriptorHeap;
 extern const int kDevice_CreateRootSignature;
 extern const int kDevice_CreateUnorderedAccessView;
@@ -14,6 +16,11 @@ extern const int kDevice_CopyDescriptorsSimple;
 extern const int kList_Reset;
 extern const int kList_Dispatch;
 extern const int kList_SetPipelineState;
+extern const int kList_DrawInstanced;
+extern const int kList_DrawIndexedInstanced;
+extern const int kList_OMSetRenderTargets;
+extern const int kList_ClearRenderTargetView;
+extern const int kList_CopyTextureRegion;
 extern const int kList_ResourceBarrier;
 extern const int kList_SetComputeRootSignature;
 extern const int kList_SetComputeRootDescriptorTable;

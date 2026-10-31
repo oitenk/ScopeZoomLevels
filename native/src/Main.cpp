@@ -12,9 +12,13 @@
 // mixes it as usual. Our work uses only root constants and root buffer views (no descriptor
 // heaps), and the game's compute state is put back exactly as it was afterwards.
 //
+// The lens area: every scope glass draw (glass_scope.mt, recognised by its pixel shader) is drawn
+// a second time into an 8-bit mask of ours, with the game's own vertex shader, so the remap knows
+// exactly where the lens is on screen, for any scope, field of view or aim animation.
+//
 // Control (for now from the CET console):
 //   Game.SZL_OutlineLens(true, 3.0)          on, with the lens zoom value; false to switch off
-//   Game.SZL_OutlineTune(0.31, 0.31, 1.0)    lens radius x / y (share of screen height), and a
+//   Game.SZL_OutlineTune(0.45, 0.45, 1.0)    outer limit x / y of the lens search (share of screen height), and a
 //                                            factor: magnification = zoom value * factor
 //   Game.SZL_OutlineCenter(0.5, 0.5)         lens centre (share of screen width / height)
 //   Game.SZL_OutlineStyle(true, 0.9)         outline only (drop the fill) inside the lens, and the
@@ -77,8 +81,10 @@ struct Lens
 {
     bool active = false;
     float zoom = 1.f;
-    float radiusX = 0.31f; // share of screen height
-    float radiusY = 0.31f;
+    // Outer limit of the area searched for lens glass (share of screen height). The lens itself
+    // comes from the mask of the scope glass drawn each frame.
+    float radiusX = 0.45f;
+    float radiusY = 0.45f;
     float factor = 1.f;    // magnification = zoom * factor
     float centerX = 0.5f;  // share of screen width / height
     float centerY = 0.5f;
@@ -182,6 +188,11 @@ struct ListState
     std::map<UINT, std::array<uint32_t, 64>> consts;
     std::map<UINT, uint64_t> constMask;
     std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> states;
+    // Render targets, to put them back after drawing a lens into our mask.
+    bool rtsKnown = false;
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rts;
+    bool hasDs = false;
+    D3D12_CPU_DESCRIPTOR_HANDLE ds{};
 };
 std::mutex g_listMutex;
 std::unordered_map<void*, ListState> g_lists;
@@ -192,12 +203,26 @@ std::unordered_map<void*, ListState> g_lists;
 constexpr const char* RemapShader = R"(
 cbuffer P : register(b0)
 {
-    uint bw; uint bh; uint pitch; uint pad0;
+    uint bw; uint bh; uint pitch; uint maskOn;
     float cx; float cy; float rx; float ry;
-    float invM; float cutoff; float pad2; float pad3;
+    float invM; float cutoff; float msx; float msy;   // msx/msy: mask size / layer size
+    float x0; float y0; uint mbx; uint mby;           // box origin in the layer / in the mask
+    uint mpitch; uint mbw; uint mbh; uint pad0;
 };
 ByteAddressBuffer Src : register(t0);
 RWByteAddressBuffer Dst : register(u0);
+ByteAddressBuffer Mask : register(t1); // the lens glass as drawn this frame (8-bit, 255 = lens)
+
+bool InLens(float2 gp)
+{
+    if (maskOn == 0)
+        return false;
+    int2 m = int2(floor(gp * float2(msx, msy))) - int2(mbx, mby);
+    if (m.x < 0 || m.y < 0 || m.x >= int(mbw) || m.y >= int(mbh))
+        return false;
+    uint a = uint(m.y) * mpitch + uint(m.x);
+    return ((Mask.Load(a & ~3u) >> ((a & 3u) * 8)) & 255u) >= 128u;
+}
 
 // cutoff > 0: outline only. The game's layer holds a solid outline (fully opaque) around a
 // hatched, half-transparent fill and a faint trailing pattern; keeping only the texels at or
@@ -220,7 +245,7 @@ void main(uint3 id : SV_DispatchThreadID)
     uint at = id.y * pitch + id.x * 4;
     float2 d = float2(id.xy) + 0.5 - float2(cx, cy);
     float2 e = d / float2(rx, ry);
-    if (dot(e, e) > 1.0)
+    if (dot(e, e) > 1.0 || !InLens(float2(x0, y0) + float2(id.xy) + 0.5))
     {
         Dst.Store(at, Src.Load(at));
         return;
@@ -235,12 +260,47 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 )";
 
+// Draws the lens glass into our mask: same vertex shader and geometry as the game's glass draw.
+constexpr const char* MaskShader = R"(
+float4 main() : SV_Target
+{
+    return 1.0;
+}
+)";
+
+// Pixel shader of the game's scope glass (base\materials\glass_scope.mt) in the transparent pass,
+// FNV-1a of its bytecode, game 2.5. Seen with and without DLSS; any scope using that material
+// (modded ones too) draws with it.
+constexpr uint64_t LensGlassShaderHash = 0x3270f6703ad3bf1full;
+
 ID3D12Device* g_device = nullptr;
 ID3D12RootSignature* g_ourRootSig = nullptr;
 ID3D12PipelineState* g_ourPso = nullptr;
+ID3DBlob* g_maskPs = nullptr;
 ID3D12Resource* g_bufSrc = nullptr;
 ID3D12Resource* g_bufDst = nullptr;
 UINT64 g_bufSize = 0;
+ID3D12Resource* g_bufMask = nullptr;
+UINT64 g_bufMaskSize = 0;
+
+// Game glass pipeline -> our twin that writes the mask.
+std::shared_mutex g_lensPsoMutex;
+std::unordered_map<void*, ID3D12PipelineState*> g_lensPsos;
+
+// Render target view -> texture, to size the mask like the target the lens is drawn into.
+std::shared_mutex g_rtvMutex;
+std::unordered_map<SIZE_T, ID3D12Resource*> g_rtvs;
+UINT g_rtvStep = 0;
+
+// Our lens mask: an 8-bit render target, kept in RENDER_TARGET state between uses. The lens
+// draws fill it; the remap reads and then clears it, so it never carries a stale lens.
+std::mutex g_maskMutex;
+ID3D12Resource* g_mask = nullptr;
+ID3D12DescriptorHeap* g_maskRtvHeap = nullptr;
+D3D12_CPU_DESCRIPTOR_HANDLE g_maskRtv{};
+UINT g_maskW = 0, g_maskH = 0;
+bool g_maskDrawn = false;
+std::atomic<bool> g_lensActive{false};
 std::atomic<bool> g_ready{false};
 std::atomic<uint64_t> g_applied{0};
 
@@ -269,10 +329,21 @@ void STDMETHODCALLTYPE HkSetComputeRootUnorderedAccessView(List* aSelf, UINT aIn
 ORIG(SetComputeRootUnorderedAccessView);
 void STDMETHODCALLTYPE HkDispatch(List* aSelf, UINT aX, UINT aY, UINT aZ);
 ORIG(Dispatch);
-// Not hooked: taken straight from the command list vtable (slot 16).
+void STDMETHODCALLTYPE HkDrawInstanced(List* aSelf, UINT aVerts, UINT aInst, UINT aStartVert, UINT aStartInst);
+ORIG(DrawInstanced);
+void STDMETHODCALLTYPE HkDrawIndexedInstanced(List* aSelf, UINT aIdx, UINT aInst, UINT aStartIdx, INT aBase,
+                                              UINT aStartInst);
+ORIG(DrawIndexedInstanced);
+void STDMETHODCALLTYPE HkOMSetRenderTargets(List* aSelf, UINT aCount, const D3D12_CPU_DESCRIPTOR_HANDLE* aRts,
+                                            BOOL aSingleRange, const D3D12_CPU_DESCRIPTOR_HANDLE* aDs);
+ORIG(OMSetRenderTargets);
+// Not hooked: taken straight from the command list vtable.
 using CopyTextureRegionFn = void(STDMETHODCALLTYPE*)(List*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT,
                                                       const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
 CopyTextureRegionFn g_CopyTextureRegion = nullptr;
+using ClearRenderTargetViewFn = void(STDMETHODCALLTYPE*)(List*, D3D12_CPU_DESCRIPTOR_HANDLE, const FLOAT[4], UINT,
+                                                          const D3D12_RECT*);
+ClearRenderTargetViewFn g_ClearRenderTargetView = nullptr;
 
 bool CreateOurPass()
 {
@@ -297,14 +368,25 @@ bool CreateOurPass()
             errors->Release();
         return false;
     }
-    D3D12_ROOT_PARAMETER params[3]{};
+    if (FAILED(compile(MaskShader, strlen(MaskShader), "SZLLensMask", nullptr, nullptr, "main", "ps_5_0",
+                       D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &g_maskPs, &errors)))
+    {
+        Info("mask shader compile failed: %s", errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+        if (errors)
+            errors->Release();
+        code->Release();
+        return false;
+    }
+    D3D12_ROOT_PARAMETER params[4]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 12};
+    params[0].Constants = {0, 0, 20};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[1].Descriptor = {0, 0};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[2].Descriptor = {0, 0};
-    D3D12_ROOT_SIGNATURE_DESC rsd{3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[3].Descriptor = {1, 0};
+    D3D12_ROOT_SIGNATURE_DESC rsd{4, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ID3DBlob* rsBlob = nullptr;
     bool ok = SUCCEEDED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsBlob, nullptr)) &&
               SUCCEEDED(g_device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
@@ -354,6 +436,73 @@ bool EnsureBuffers(UINT64 aSize)
         return false;
     }
     g_bufSize = aSize;
+    return true;
+}
+
+bool EnsureMaskBuffer(UINT64 aSize)
+{
+    if (g_bufMaskSize >= aSize)
+        return true;
+    if (g_bufMask)
+        g_bufMask->Release();
+    g_bufMask = nullptr;
+    g_bufMaskSize = 0;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = aSize;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 nullptr, IID_PPV_ARGS(&g_bufMask))))
+        return false;
+    g_bufMaskSize = aSize;
+    return true;
+}
+
+// Called with g_maskMutex held, while recording a lens draw: makes sure the mask matches the
+// target the lens is drawn into. A new mask is cleared in this list before its first use.
+bool EnsureMask(List* aList, UINT aW, UINT aH)
+{
+    if (g_mask && g_maskW == aW && g_maskH == aH)
+        return true;
+    // A replaced mask may still be referenced by lists already recorded: kept alive (only
+    // happens when the resolution changes).
+    g_mask = nullptr;
+    if (!g_maskRtvHeap)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_maskRtvHeap))))
+            return false;
+        g_maskRtv = g_maskRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    }
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = aW;
+    td.Height = aH;
+    td.DepthOrArraySize = 1;
+    td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8_UNORM, {0, 0, 0, 0}};
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 &clear, IID_PPV_ARGS(&g_mask))))
+    {
+        g_mask = nullptr;
+        return false;
+    }
+    g_device->CreateRenderTargetView(g_mask, nullptr, g_maskRtv);
+    const FLOAT zero[4] = {0, 0, 0, 0};
+    g_ClearRenderTargetView(aList, g_maskRtv, zero, 0, nullptr);
+    g_maskW = aW;
+    g_maskH = aH;
+    g_maskDrawn = false;
+    Info("lens mask %ux%u", aW, aH);
     return true;
 }
 
@@ -449,6 +598,12 @@ void AfterOverlay(List* aList)
     float m = lens.zoom * lens.factor;
     if (!lens.active || m <= 1.001f || !g_ready)
         return;
+    {
+        // Only where scope glass was drawn: no glass, nothing to magnify.
+        std::lock_guard lock(g_maskMutex);
+        if (!g_mask || !g_maskDrawn)
+            return;
+    }
 
     ListState s;
     {
@@ -496,21 +651,69 @@ void AfterOverlay(List* aList)
         g_ResourceBarrier(aList, 1, &b1);
     g_CopyTextureRegion(aList, &src, 0, 0, 0, &tex, &box);
 
+    // 1b. The lens mask's matching box -> mask buffer; then the mask is cleared for the next
+    // frame. Without a mask (no scope glass drawn yet) nothing is magnified.
+    struct
+    {
+        UINT bw, bh, pitch, maskOn;
+        float cx, cy, rx, ry, invM, cutoff, msx, msy, x0, y0;
+        UINT mbx, mby, mpitch, mbw, mbh, pad0;
+    } c{bw, bh, pitch, 0, cx - x0, cy - y0, rx, ry, 1.f / m, lens.outlineOnly ? lens.cutoff : 0.f, 1, 1,
+        static_cast<float>(x0), static_cast<float>(y0), 0, 0, 0, 0, 0, 0};
+    bool maskUsed = false;
+    {
+        std::lock_guard lock(g_maskMutex);
+        if (g_mask && g_maskDrawn)
+        {
+            c.msx = g_maskW / w;
+            c.msy = g_maskH / h;
+            UINT mx0 = std::min(static_cast<UINT>(x0 * c.msx), g_maskW - 1);
+            UINT my0 = std::min(static_cast<UINT>(y0 * c.msy), g_maskH - 1);
+            UINT mx1 = std::min(static_cast<UINT>(std::ceil(x1 * c.msx)), g_maskW);
+            UINT my1 = std::min(static_cast<UINT>(std::ceil(y1 * c.msy)), g_maskH);
+            UINT mbw = mx1 > mx0 ? mx1 - mx0 : 0, mbh = my1 > my0 ? my1 - my0 : 0;
+            UINT mpitch = (mbw + 255) & ~255u;
+            if (mbw && mbh && EnsureMaskBuffer(static_cast<UINT64>(mpitch) * mbh))
+            {
+                D3D12_TEXTURE_COPY_LOCATION mtex{g_mask, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+                mtex.SubresourceIndex = 0;
+                D3D12_TEXTURE_COPY_LOCATION mbuf{g_bufMask, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+                mbuf.PlacedFootprint = {0, {DXGI_FORMAT_R8_UNORM, mbw, mbh, 1, mpitch}};
+                D3D12_BOX mbox{mx0, my0, 0, mx1, my1, 1};
+                D3D12_RESOURCE_BARRIER m1 = Transition(g_mask, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+                g_ResourceBarrier(aList, 1, &m1);
+                g_CopyTextureRegion(aList, &mbuf, 0, 0, 0, &mtex, &mbox);
+                D3D12_RESOURCE_BARRIER m2[2] = {
+                    Transition(g_mask, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                    Transition(g_bufMask, D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+                g_ResourceBarrier(aList, 2, m2);
+                const FLOAT zero[4] = {0, 0, 0, 0};
+                g_ClearRenderTargetView(aList, g_maskRtv, zero, 0, nullptr);
+                g_maskDrawn = false;
+                c.maskOn = 1;
+                c.mbx = mx0;
+                c.mby = my0;
+                c.mpitch = mpitch;
+                c.mbw = mbw;
+                c.mbh = mbh;
+                maskUsed = true;
+            }
+        }
+    }
+
     // 2. Remap into the second buffer.
     D3D12_RESOURCE_BARRIER b2[2] = {
         Transition(g_bufSrc, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         Transition(overlay, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
     g_ResourceBarrier(aList, 2, b2);
-    struct
-    {
-        UINT bw, bh, pitch, pad0;
-        float cx, cy, rx, ry, invM, cutoff, pad2, pad3;
-    } c{bw, bh, pitch, 0, cx - x0, cy - y0, rx, ry, 1.f / m, lens.outlineOnly ? lens.cutoff : 0.f, 0, 0};
     g_SetComputeRootSignature(aList, g_ourRootSig);
     g_SetPipelineState(aList, g_ourPso);
-    g_SetComputeRoot32BitConstants(aList, 0, 12, &c, 0);
+    g_SetComputeRoot32BitConstants(aList, 0, 20, &c, 0);
     g_SetComputeRootShaderResourceView(aList, 1, g_bufSrc->GetGPUVirtualAddress());
     g_SetComputeRootUnorderedAccessView(aList, 2, g_bufDst->GetGPUVirtualAddress());
+    g_SetComputeRootShaderResourceView(aList, 3, (maskUsed ? g_bufMask : g_bufSrc)->GetGPUVirtualAddress());
     g_Dispatch(aList, (bw + 7) / 8, (bh + 7) / 8, 1);
 
     // 3. Result -> the layer, then everything back to how it was.
@@ -524,6 +727,12 @@ void AfterOverlay(List* aList)
         Transition(g_bufDst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         Transition(g_bufSrc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
     g_ResourceBarrier(aList, 3, b4);
+    if (maskUsed)
+    {
+        D3D12_RESOURCE_BARRIER b5 = Transition(g_bufMask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                               D3D12_RESOURCE_STATE_COPY_DEST);
+        g_ResourceBarrier(aList, 1, &b5);
+    }
     Restore(aList, s);
 
     if (g_applied++ == 0)
@@ -549,6 +758,70 @@ HRESULT STDMETHODCALLTYPE HkCreateComputePipelineState(ID3D12Device* aSelf, cons
         Info("overlay shader found (pipeline %p)", *aOut);
     }
     return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HkCreateGraphicsPipelineState(ID3D12Device* aSelf, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* aDesc,
+                                                        REFIID aRiid, void** aOut);
+ORIG(CreateGraphicsPipelineState);
+HRESULT STDMETHODCALLTYPE HkCreateGraphicsPipelineState(ID3D12Device* aSelf, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* aDesc,
+                                                        REFIID aRiid, void** aOut)
+{
+    HRESULT hr = g_CreateGraphicsPipelineState(aSelf, aDesc, aRiid, aOut);
+    if (SUCCEEDED(hr) && aDesc && aOut && *aOut && g_maskPs && aDesc->PS.pShaderBytecode &&
+        Fnv1a(aDesc->PS.pShaderBytecode, aDesc->PS.BytecodeLength) == LensGlassShaderHash)
+    {
+        // The twin: the game's root signature, vertex shader, input layout and rasterizer, with
+        // our pixel shader writing 1 into a single 8-bit target, no blending, no depth.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *aDesc;
+        d.PS = {g_maskPs->GetBufferPointer(), g_maskPs->GetBufferSize()};
+        d.StreamOutput = {};
+        d.BlendState = {};
+        d.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+        d.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
+        d.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+        d.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+        d.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+        d.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        d.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
+        d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        d.SampleMask = UINT_MAX;
+        d.DepthStencilState = {};
+        d.NumRenderTargets = 1;
+        for (auto& f : d.RTVFormats)
+            f = DXGI_FORMAT_UNKNOWN;
+        d.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
+        d.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        d.SampleDesc = {1, 0};
+        d.CachedPSO = {};
+        d.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        ID3D12PipelineState* twin = nullptr;
+        ID3D12PipelineState* game = nullptr;
+        static_cast<IUnknown*>(*aOut)->QueryInterface(IID_PPV_ARGS(&game));
+        if (game && SUCCEEDED(g_CreateGraphicsPipelineState(aSelf, &d, IID_PPV_ARGS(&twin))))
+        {
+            std::unique_lock lock(g_lensPsoMutex);
+            g_lensPsos[game] = twin;
+            Info("scope glass pipeline %p: lens mask twin ready", game);
+        }
+        else
+            Info("scope glass pipeline %p: lens mask twin FAILED", game);
+        if (game)
+            game->Release();
+    }
+    return hr;
+}
+
+void STDMETHODCALLTYPE HkCreateRenderTargetView(ID3D12Device* aSelf, ID3D12Resource* aRes,
+                                                const D3D12_RENDER_TARGET_VIEW_DESC* aDesc,
+                                                D3D12_CPU_DESCRIPTOR_HANDLE aHandle);
+ORIG(CreateRenderTargetView);
+void STDMETHODCALLTYPE HkCreateRenderTargetView(ID3D12Device* aSelf, ID3D12Resource* aRes,
+                                                const D3D12_RENDER_TARGET_VIEW_DESC* aDesc,
+                                                D3D12_CPU_DESCRIPTOR_HANDLE aHandle)
+{
+    g_CreateRenderTargetView(aSelf, aRes, aDesc, aHandle);
+    std::unique_lock lock(g_rtvMutex);
+    g_rtvs[aHandle.ptr] = aRes;
 }
 
 HRESULT STDMETHODCALLTYPE HkCreateDescriptorHeap(ID3D12Device* aSelf, const D3D12_DESCRIPTOR_HEAP_DESC* aDesc,
@@ -772,6 +1045,82 @@ void STDMETHODCALLTYPE HkSetComputeRootUnorderedAccessView(List* aSelf, UINT aIn
     g_SetComputeRootUnorderedAccessView(aSelf, aIndex, aVa);
 }
 
+void STDMETHODCALLTYPE HkOMSetRenderTargets(List* aSelf, UINT aCount, const D3D12_CPU_DESCRIPTOR_HANDLE* aRts,
+                                            BOOL aSingleRange, const D3D12_CPU_DESCRIPTOR_HANDLE* aDs)
+{
+    {
+        std::lock_guard lock(g_listMutex);
+        auto& s = g_lists[aSelf];
+        s.rtsKnown = true;
+        s.rts.clear();
+        for (UINT i = 0; i < aCount && aRts; ++i)
+            s.rts.push_back({aSingleRange ? aRts[0].ptr + static_cast<SIZE_T>(i) * g_rtvStep : aRts[i].ptr});
+        s.hasDs = aDs != nullptr;
+        if (aDs)
+            s.ds = *aDs;
+    }
+    g_OMSetRenderTargets(aSelf, aCount, aRts, aSingleRange, aDs);
+}
+
+// After a scope glass draw: the same draw again with the twin pipeline into our lens mask, then
+// the game's render targets and pipeline are put back. Returns false if it could not.
+template<typename Redraw>
+void LensMaskDraw(List* aList, Redraw aRedraw)
+{
+    if (!g_lensActive.load(std::memory_order_relaxed) || !g_ready)
+        return;
+    ListState s;
+    {
+        std::lock_guard lock(g_listMutex);
+        auto it = g_lists.find(aList);
+        if (it == g_lists.end() || !it->second.rtsKnown || it->second.rts.empty())
+            return;
+        s.pso = it->second.pso;
+        s.rts = it->second.rts;
+        s.hasDs = it->second.hasDs;
+        s.ds = it->second.ds;
+    }
+    ID3D12PipelineState* twin = nullptr;
+    {
+        std::shared_lock lock(g_lensPsoMutex);
+        auto it = g_lensPsos.find(s.pso);
+        if (it == g_lensPsos.end())
+            return;
+        twin = it->second;
+    }
+    ID3D12Resource* target = nullptr;
+    {
+        std::shared_lock lock(g_rtvMutex);
+        auto it = g_rtvs.find(s.rts[0].ptr);
+        if (it == g_rtvs.end() || !it->second)
+            return;
+        target = it->second;
+    }
+    D3D12_RESOURCE_DESC td = target->GetDesc();
+    std::lock_guard lock(g_maskMutex);
+    if (!EnsureMask(aList, static_cast<UINT>(td.Width), td.Height))
+        return;
+    g_OMSetRenderTargets(aList, 1, &g_maskRtv, FALSE, nullptr);
+    g_SetPipelineState(aList, twin);
+    aRedraw();
+    g_OMSetRenderTargets(aList, static_cast<UINT>(s.rts.size()), s.rts.data(), FALSE, s.hasDs ? &s.ds : nullptr);
+    g_SetPipelineState(aList, static_cast<ID3D12PipelineState*>(s.pso));
+    g_maskDrawn = true;
+}
+
+void STDMETHODCALLTYPE HkDrawInstanced(List* aSelf, UINT aVerts, UINT aInst, UINT aStartVert, UINT aStartInst)
+{
+    g_DrawInstanced(aSelf, aVerts, aInst, aStartVert, aStartInst);
+    LensMaskDraw(aSelf, [&] { g_DrawInstanced(aSelf, aVerts, aInst, aStartVert, aStartInst); });
+}
+
+void STDMETHODCALLTYPE HkDrawIndexedInstanced(List* aSelf, UINT aIdx, UINT aInst, UINT aStartIdx, INT aBase,
+                                              UINT aStartInst)
+{
+    g_DrawIndexedInstanced(aSelf, aIdx, aInst, aStartIdx, aBase, aStartInst);
+    LensMaskDraw(aSelf, [&] { g_DrawIndexedInstanced(aSelf, aIdx, aInst, aStartIdx, aBase, aStartInst); });
+}
+
 void STDMETHODCALLTYPE HkDispatch(List* aSelf, UINT aX, UINT aY, UINT aZ)
 {
     g_Dispatch(aSelf, aX, aY, aZ);
@@ -803,7 +1152,12 @@ void InstallHooks(ID3D12Device* aDevice)
         g_deserializer = reinterpret_cast<DeserializerFn>(
             GetProcAddress(d3d12, "D3D12CreateVersionedRootSignatureDeserializer"));
 
+    g_rtvStep = aDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     bool ok = g_deserializer != nullptr;
+    ok &= HookSlot(aDevice, kDevice_CreateGraphicsPipelineState, &HkCreateGraphicsPipelineState,
+                   &g_CreateGraphicsPipelineState, "CreateGraphicsPipelineState");
+    ok &= HookSlot(aDevice, kDevice_CreateRenderTargetView, &HkCreateRenderTargetView, &g_CreateRenderTargetView,
+                   "CreateRenderTargetView");
     ok &= HookSlot(aDevice, kDevice_CreateComputePipelineState, &HkCreateComputePipelineState,
                    &g_CreateComputePipelineState, "CreateComputePipelineState");
     ok &= HookSlot(aDevice, kDevice_CreateDescriptorHeap, &HkCreateDescriptorHeap, &g_CreateDescriptorHeap,
@@ -823,7 +1177,13 @@ void InstallHooks(ID3D12Device* aDevice)
     {
         list->Close();
         void** vtable = *reinterpret_cast<void***>(list);
-        g_CopyTextureRegion = reinterpret_cast<decltype(g_CopyTextureRegion)>(vtable[16]);
+        g_CopyTextureRegion = reinterpret_cast<decltype(g_CopyTextureRegion)>(vtable[kList_CopyTextureRegion]);
+        g_ClearRenderTargetView = reinterpret_cast<decltype(g_ClearRenderTargetView)>(vtable[kList_ClearRenderTargetView]);
+        ok &= HookSlot(list, kList_DrawInstanced, &HkDrawInstanced, &g_DrawInstanced, "DrawInstanced");
+        ok &= HookSlot(list, kList_DrawIndexedInstanced, &HkDrawIndexedInstanced, &g_DrawIndexedInstanced,
+                       "DrawIndexedInstanced");
+        ok &= HookSlot(list, kList_OMSetRenderTargets, &HkOMSetRenderTargets, &g_OMSetRenderTargets,
+                       "OMSetRenderTargets");
         ok &= HookSlot(list, kList_Reset, &HkReset, &g_Reset, "Reset");
         ok &= HookSlot(list, kList_Dispatch, &HkDispatch, &g_Dispatch, "Dispatch");
         ok &= HookSlot(list, kList_SetPipelineState, &HkSetPipelineState, &g_SetPipelineState, "SetPipelineState");
@@ -889,6 +1249,7 @@ void OutlineLens(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int
         Info("lens %s, zoom %.2f", active ? "on" : "off", zoom);
     g_lens.active = active;
     g_lens.zoom = zoom;
+    g_lensActive = active;
 }
 
 void OutlineTune(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t)
@@ -985,7 +1346,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Outline Fix 0.2.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Outline Fix 0.3.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -999,7 +1360,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLOutlineFix";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 2, 0);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 0);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

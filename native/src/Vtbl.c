@@ -9,6 +9,8 @@
 #define SLOT(vt, m) ((int)(offsetof(vt, m) / sizeof(void*)))
 
 const int kDevice_CreateComputePipelineState = SLOT(ID3D12DeviceVtbl, CreateComputePipelineState);
+const int kDevice_CreateGraphicsPipelineState = SLOT(ID3D12DeviceVtbl, CreateGraphicsPipelineState);
+const int kDevice_CreateRenderTargetView = SLOT(ID3D12DeviceVtbl, CreateRenderTargetView);
 const int kDevice_CreateDescriptorHeap = SLOT(ID3D12DeviceVtbl, CreateDescriptorHeap);
 const int kDevice_CreateRootSignature = SLOT(ID3D12DeviceVtbl, CreateRootSignature);
 const int kDevice_CreateUnorderedAccessView = SLOT(ID3D12DeviceVtbl, CreateUnorderedAccessView);
@@ -18,6 +20,11 @@ const int kDevice_CopyDescriptorsSimple = SLOT(ID3D12DeviceVtbl, CopyDescriptors
 const int kList_Reset = SLOT(ID3D12GraphicsCommandListVtbl, Reset);
 const int kList_Dispatch = SLOT(ID3D12GraphicsCommandListVtbl, Dispatch);
 const int kList_SetPipelineState = SLOT(ID3D12GraphicsCommandListVtbl, SetPipelineState);
+const int kList_DrawInstanced = SLOT(ID3D12GraphicsCommandListVtbl, DrawInstanced);
+const int kList_DrawIndexedInstanced = SLOT(ID3D12GraphicsCommandListVtbl, DrawIndexedInstanced);
+const int kList_OMSetRenderTargets = SLOT(ID3D12GraphicsCommandListVtbl, OMSetRenderTargets);
+const int kList_ClearRenderTargetView = SLOT(ID3D12GraphicsCommandListVtbl, ClearRenderTargetView);
+const int kList_CopyTextureRegion = SLOT(ID3D12GraphicsCommandListVtbl, CopyTextureRegion);
 const int kList_ResourceBarrier = SLOT(ID3D12GraphicsCommandListVtbl, ResourceBarrier);
 const int kList_SetComputeRootSignature = SLOT(ID3D12GraphicsCommandListVtbl, SetComputeRootSignature);
 const int kList_SetComputeRootDescriptorTable = SLOT(ID3D12GraphicsCommandListVtbl, SetComputeRootDescriptorTable);
