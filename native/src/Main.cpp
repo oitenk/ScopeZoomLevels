@@ -21,6 +21,7 @@
 //   Game.SZL_OutlineTune(0.45, 0.45, 1.0)    outer limit x / y of the lens search (share of screen height), and a
 //                                            factor: magnification = zoom value * factor
 //   Game.SZL_OutlineCenter(0.5, 0.5)         lens centre (share of screen width / height)
+//   Game.SZL_OutlineDebug(true)              tint the lens area green and the searched area blue
 //   Game.SZL_OutlineStyle(true, 0.9)         outline only (drop the fill) inside the lens, and the
 //                                            opacity a texel needs to count as outline; false = vanilla
 
@@ -89,6 +90,7 @@ struct Lens
     float factor = 1.f;    // magnification = zoom * factor
     float centerX = 0.5f;  // share of screen width / height
     float centerY = 0.5f;
+    bool debug = false; // tint the lens area green and the searched area blue
     bool outlineOnly = true;
     float cutoff = 0.9f;   // opacity a texel needs to count as outline
 };
@@ -227,7 +229,7 @@ cbuffer P : register(b0)
     float cx; float cy; float rx; float ry;
     float invM; float cutoff; float msx; float msy;   // msx/msy: mask size / layer size
     float x0; float y0; uint mbx; uint mby;           // box origin in the layer / in the mask
-    uint mpitch; uint mbw; uint mbh; uint pad0;
+    uint mpitch; uint mbw; uint mbh; uint debug;      // debug: tint lens green, search area blue
 };
 ByteAddressBuffer Src : register(t0);
 RWByteAddressBuffer Dst : register(u0);
@@ -265,8 +267,17 @@ void main(uint3 id : SV_DispatchThreadID)
     uint at = id.y * pitch + id.x * 4;
     float2 d = float2(id.xy) + 0.5 - float2(cx, cy);
     float2 e = d / float2(rx, ry);
-    if (dot(e, e) > 1.0 || !InLens(float2(x0, y0) + float2(id.xy) + 0.5))
+    bool searched = dot(e, e) <= 1.0;
+    if (!searched || !InLens(float2(x0, y0) + float2(id.xy) + 0.5))
     {
+        if (debug != 0 && searched)
+        {
+            uint v = Src.Load(at);
+            float4 o = float4(v & 255, (v >> 8) & 255, (v >> 16) & 255, v >> 24) / 255.0;
+            uint4 q = uint4(round(saturate(lerp(o, float4(0, 0, 1, 1), 0.15)) * 255.0));
+            Dst.Store(at, q.x | (q.y << 8) | (q.z << 16) | (q.w << 24));
+            return;
+        }
         Dst.Store(at, Src.Load(at));
         return;
     }
@@ -275,6 +286,8 @@ void main(uint3 id : SV_DispatchThreadID)
     float2 f = s - i;
     float4 c = lerp(lerp(Texel(i), Texel(i + int2(1, 0)), f.x),
                     lerp(Texel(i + int2(0, 1)), Texel(i + int2(1, 1)), f.x), f.y);
+    if (debug != 0)
+        c = lerp(c, float4(0, 1, 0, 1), 0.3);
     uint4 u = uint4(round(saturate(c) * 255.0));
     Dst.Store(at, u.x | (u.y << 8) | (u.z << 16) | (u.w << 24));
 }
@@ -321,6 +334,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE g_maskRtv{};
 UINT g_maskW = 0, g_maskH = 0;
 bool g_maskDrawn = false;
 std::atomic<bool> g_lensActive{false};
+std::atomic<uint32_t> g_maskDraws{0}; // glass draws put into the mask since the last remap
 std::atomic<bool> g_ready{false};
 std::atomic<uint64_t> g_applied{0};
 
@@ -622,7 +636,7 @@ void AfterOverlay(List* aList)
     // back to a fixed circle (the 0.2 behaviour) rather than no fix.
     {
         std::lock_guard lock(g_maskMutex);
-        if (!g_mask || !g_maskDrawn)
+        if (!g_mask)
         {
             std::shared_lock twins(g_lensPsoMutex);
             if (!g_lensPsos.empty())
@@ -683,13 +697,13 @@ void AfterOverlay(List* aList)
     {
         UINT bw, bh, pitch, maskOn;
         float cx, cy, rx, ry, invM, cutoff, msx, msy, x0, y0;
-        UINT mbx, mby, mpitch, mbw, mbh, pad0;
+        UINT mbx, mby, mpitch, mbw, mbh, debug;
     } c{bw, bh, pitch, 0, cx - x0, cy - y0, rx, ry, 1.f / m, lens.outlineOnly ? lens.cutoff : 0.f, 1, 1,
-        static_cast<float>(x0), static_cast<float>(y0), 0, 0, 0, 0, 0, 0};
+        static_cast<float>(x0), static_cast<float>(y0), 0, 0, 0, 0, 0, lens.debug ? 1u : 0u};
     bool maskUsed = false;
     {
         std::lock_guard lock(g_maskMutex);
-        if (g_mask && g_maskDrawn)
+        if (g_mask)
         {
             c.msx = g_maskW / w;
             c.msy = g_maskH / h;
@@ -761,9 +775,11 @@ void AfterOverlay(List* aList)
     }
     Restore(aList, s);
 
-    if (g_applied++ == 0)
-        Info("first remap: layer %llux%u, lens box %ux%u at %u,%u, magnification %.2f",
-             static_cast<unsigned long long>(d.Width), d.Height, bw, bh, x0, y0, m);
+    uint32_t draws = g_maskDraws.exchange(0);
+    if (g_applied++ < 8)
+        Info("remap %llu: layer %llux%u, box %ux%u at %u,%u, magnification %.2f, lens mask %s (%u glass draws)",
+             static_cast<unsigned long long>(g_applied.load()), static_cast<unsigned long long>(d.Width), d.Height, bw,
+             bh, x0, y0, m, maskUsed ? "used" : "NOT used", draws);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1155,6 +1171,7 @@ void LensMaskDraw(List* aList, Redraw aRedraw)
     g_OMSetRenderTargets(aList, static_cast<UINT>(s.rts.size()), s.rts.data(), FALSE, s.hasDs ? &s.ds : nullptr);
     g_SetPipelineState(aList, static_cast<ID3D12PipelineState*>(s.pso));
     g_maskDrawn = true;
+    ++g_maskDraws;
 }
 
 void STDMETHODCALLTYPE HkDrawInstanced(List* aSelf, UINT aVerts, UINT aInst, UINT aStartVert, UINT aStartInst)
@@ -1340,6 +1357,16 @@ void OutlineStyle(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, in
     Info("style: %s, cutoff %.2f", outlineOnly ? "outline only" : "vanilla (fill)", g_lens.cutoff);
 }
 
+void OutlineDebug(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t)
+{
+    bool on = false;
+    RED4ext::GetParameter(aFrame, &on);
+    aFrame->code++;
+    std::lock_guard lock(g_lensMutex);
+    g_lens.debug = on;
+    Info("debug view %s", on ? "on" : "off");
+}
+
 void RegisterTypes()
 {
 }
@@ -1353,6 +1380,12 @@ void PostRegisterTypes()
         f->flags = flags;
         f->AddParam("Bool", "active");
         f->AddParam("Float", "zoom");
+        rtti->RegisterFunction(f);
+    }
+    {
+        auto f = RED4ext::CGlobalFunction::Create("SZL_OutlineDebug", "SZL_OutlineDebug", &OutlineDebug);
+        f->flags = flags;
+        f->AddParam("Bool", "on");
         rtti->RegisterFunction(f);
     }
     {
@@ -1395,7 +1428,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Outline Fix 0.3.1 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Outline Fix 0.3.2 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -1409,7 +1442,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLOutlineFix";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 1);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 2);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
