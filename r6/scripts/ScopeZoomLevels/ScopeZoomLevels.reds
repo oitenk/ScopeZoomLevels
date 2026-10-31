@@ -143,7 +143,10 @@ public class SZLSystem extends ScriptableSystem {
   // next level first. A scope without a vanilla level starts at level 1 and cycles 1..n.
   private func Apply(advance: Bool) -> Void {
     let lens: ref<SZLLens> = this.FindLens(advance);
-    if !IsDefined(lens) { return; }
+    if !IsDefined(lens) {
+      SZL_SetOutlineLens(false, 1.0);
+      return;
+    }
     let last: Int32 = ArraySize(lens.levels);      // level 0 is vanilla
     let first: Int32 = lens.noVanilla ? 1 : 0;
     let weaponID: ItemID = lens.weapon.GetItemID();
@@ -153,6 +156,7 @@ public class SZLSystem extends ScriptableSystem {
       this.SetLevel(weaponID, level);
     }
     if !this.IsAiming() { level = 0; }
+    SZL_SetOutlineLens(level > 0, level > 0 ? lens.levels[level - 1] : 1.0);
     let zoom: String = level > 0 ? FloatToStringPrec(lens.levels[level - 1], 2) + "x" : "vanilla";
     let switched: array<CName>;
     for part in lens.parts {
@@ -260,6 +264,16 @@ public class SZLSystem extends ScriptableSystem {
 
   public func NoAimZoom() -> Bool {
     return !IsDefined(this.m_settings) || this.m_settings.noAimZoom;
+  }
+}
+
+// Tells the native outline fix (red4ext\plugins\SZLOutlineFix) the lens zoom, so ping outlines
+// line up with the magnified picture. Looked up by name, so without the plugin (or after a game
+// update it does not support) this does nothing and the mod works as before.
+func SZL_SetOutlineLens(active: Bool, zoom: Float) -> Void {
+  let fn: ref<ReflectionStaticFunc> = Reflection.GetGlobalFunction(n"SZL_OutlineLens");
+  if IsDefined(fn) {
+    fn.Call([ToVariant(active), ToVariant(zoom)]);
   }
 }
 

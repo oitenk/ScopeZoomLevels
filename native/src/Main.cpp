@@ -875,9 +875,10 @@ void OutlineLens(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int
     RED4ext::GetParameter(aFrame, &zoom);
     aFrame->code++;
     std::lock_guard lock(g_lensMutex);
+    if (g_lens.active != active || g_lens.zoom != zoom)
+        Info("lens %s, zoom %.2f", active ? "on" : "off", zoom);
     g_lens.active = active;
     g_lens.zoom = zoom;
-    Info("lens %s, zoom %.2f", active ? "on" : "off", zoom);
 }
 
 void OutlineTune(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t)
