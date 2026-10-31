@@ -24,6 +24,7 @@ const int kList_DrawInstanced = SLOT(ID3D12GraphicsCommandListVtbl, DrawInstance
 const int kList_DrawIndexedInstanced = SLOT(ID3D12GraphicsCommandListVtbl, DrawIndexedInstanced);
 const int kList_OMSetRenderTargets = SLOT(ID3D12GraphicsCommandListVtbl, OMSetRenderTargets);
 const int kList_ClearRenderTargetView = SLOT(ID3D12GraphicsCommandListVtbl, ClearRenderTargetView);
+const int kList_CopyBufferRegion = SLOT(ID3D12GraphicsCommandListVtbl, CopyBufferRegion);
 const int kList_CopyTextureRegion = SLOT(ID3D12GraphicsCommandListVtbl, CopyTextureRegion);
 const int kList_ResourceBarrier = SLOT(ID3D12GraphicsCommandListVtbl, ResourceBarrier);
 const int kList_SetComputeRootSignature = SLOT(ID3D12GraphicsCommandListVtbl, SetComputeRootSignature);

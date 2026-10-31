@@ -20,6 +20,7 @@ extern const int kList_DrawInstanced;
 extern const int kList_DrawIndexedInstanced;
 extern const int kList_OMSetRenderTargets;
 extern const int kList_ClearRenderTargetView;
+extern const int kList_CopyBufferRegion;
 extern const int kList_CopyTextureRegion;
 extern const int kList_ResourceBarrier;
 extern const int kList_SetComputeRootSignature;

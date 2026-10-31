@@ -1,4 +1,4 @@
-﻿// SZL Outline Fix - test plugin for Scope Zoom Levels: makes ping outlines line up with the
+// SZL Outline Fix - test plugin for Scope Zoom Levels: makes ping outlines line up with the
 // magnified picture in a zoomed scope lens.
 //
 // Why: the lens shader enlarges a copy of the scene, but the game draws the ping/scan outlines
@@ -43,6 +43,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <thread>
 #include <vector>
 
 #include "LensMaskDxil.h"
@@ -591,6 +592,112 @@ ID3D12Resource* FindOverlay(const ListState& aState)
     return nullptr;
 }
 
+// One-time diagnostic (about 2 seconds into the first aim): copies the layer box before and
+// after the remap and the lens mask box to readback buffers, then a thread saves them to
+// red4ext\logs\szl-fixdump-*.bin and logs where the mask and the outlines are.
+using CopyBufferRegionFn = void(STDMETHODCALLTYPE*)(List*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64);
+CopyBufferRegionFn g_CopyBufferRegion = nullptr;
+std::atomic<bool> g_diagDone{false};
+
+ID3D12Resource* Readback(UINT64 aSize)
+{
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = aSize;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* r = nullptr;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&r))))
+        return nullptr;
+    return r;
+}
+
+// Called with g_bufSrc and g_bufMask in NON_PIXEL_SHADER_RESOURCE and g_bufDst in COPY_SOURCE;
+// leaves them that way.
+void DiagnosticSave(List* aList, UINT aW, UINT aH, UINT aPitch, UINT aMw, UINT aMh, UINT aMpitch, UINT aX0, UINT aY0)
+{
+    UINT64 layerBytes = static_cast<UINT64>(aPitch) * aH, maskBytes = static_cast<UINT64>(aMpitch) * aMh;
+    ID3D12Resource* rbSrc = Readback(layerBytes);
+    ID3D12Resource* rbDst = Readback(layerBytes);
+    ID3D12Resource* rbMask = Readback(maskBytes);
+    if (!rbSrc || !rbDst || !rbMask || !g_CopyBufferRegion)
+    {
+        Info("diagnostic: could not create readback buffers");
+        return;
+    }
+    D3D12_RESOURCE_BARRIER to[2] = {
+        Transition(g_bufSrc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(g_bufMask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+    g_ResourceBarrier(aList, 2, to);
+    g_CopyBufferRegion(aList, rbSrc, 0, g_bufSrc, 0, layerBytes);
+    g_CopyBufferRegion(aList, rbDst, 0, g_bufDst, 0, layerBytes);
+    g_CopyBufferRegion(aList, rbMask, 0, g_bufMask, 0, maskBytes);
+    D3D12_RESOURCE_BARRIER back[2] = {
+        Transition(g_bufSrc, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        Transition(g_bufMask, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+    g_ResourceBarrier(aList, 2, back);
+
+    std::thread([=] {
+        Sleep(3000); // long after the frame has run on the GPU
+        wchar_t exe[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring logs = exe;
+        for (int i = 0; i < 3; ++i)
+            logs = logs.substr(0, logs.find_last_of(L'\\'));
+        logs += L"\\red4ext\\logs\\";
+        auto save = [&](ID3D12Resource* aRb, UINT64 aBytes, const wchar_t* aName) -> std::vector<uint8_t> {
+            std::vector<uint8_t> bytes(aBytes);
+            void* p = nullptr;
+            D3D12_RANGE r{0, static_cast<SIZE_T>(aBytes)};
+            if (SUCCEEDED(aRb->Map(0, &r, &p)))
+            {
+                memcpy(bytes.data(), p, aBytes);
+                D3D12_RANGE none{0, 0};
+                aRb->Unmap(0, &none);
+            }
+            aRb->Release();
+            FILE* f = nullptr;
+            if (_wfopen_s(&f, (logs + aName).c_str(), L"wb") == 0 && f)
+            {
+                fwrite(bytes.data(), 1, bytes.size(), f);
+                fclose(f);
+            }
+            return bytes;
+        };
+        wchar_t nameSrc[96], nameDst[96], nameMask[96];
+        swprintf(nameSrc, 96, L"szl-fixdump-before_%ux%u_pitch%u.bin", aW, aH, aPitch);
+        swprintf(nameDst, 96, L"szl-fixdump-after_%ux%u_pitch%u.bin", aW, aH, aPitch);
+        swprintf(nameMask, 96, L"szl-fixdump-mask_%ux%u_pitch%u.bin", aMw, aMh, aMpitch);
+        auto src = save(rbSrc, layerBytes, nameSrc);
+        auto dst = save(rbDst, layerBytes, nameDst);
+        auto mask = save(rbMask, maskBytes, nameMask);
+        auto box = [](const std::vector<uint8_t>& b, UINT w, UINT h, UINT pitch, UINT bpp, UINT ch, UINT minV,
+                      UINT& n, UINT& xa, UINT& ya, UINT& xb, UINT& yb) {
+            n = 0, xa = ya = UINT_MAX, xb = yb = 0;
+            for (UINT y = 0; y < h; ++y)
+                for (UINT x = 0; x < w; ++x)
+                    if (b[static_cast<size_t>(y) * pitch + x * bpp + ch] >= minV)
+                    {
+                        ++n;
+                        xa = std::min(xa, x), ya = std::min(ya, y), xb = std::max(xb, x), yb = std::max(yb, y);
+                    }
+        };
+        UINT n, xa, ya, xb, yb;
+        box(mask, aMw, aMh, aMpitch, 1, 0, 128, n, xa, ya, xb, yb);
+        Info("diagnostic: mask %u lens pixels, box x %u..%u y %u..%u (in the search box at %u,%u)", n, xa, xb, ya, yb,
+             aX0, aY0);
+        box(src, aW, aH, aPitch, 4, 3, 230, n, xa, ya, xb, yb);
+        Info("diagnostic: before %u outline pixels, box x %u..%u y %u..%u", n, xa, xb, ya, yb);
+        box(dst, aW, aH, aPitch, 4, 3, 230, n, xa, ya, xb, yb);
+        Info("diagnostic: after %u outline pixels, box x %u..%u y %u..%u", n, xa, xb, ya, yb);
+    }).detach();
+}
+
 void Restore(List* aList, const ListState& s)
 {
     g_SetComputeRootSignature(aList, static_cast<ID3D12RootSignature*>(s.rootSig));
@@ -762,6 +869,8 @@ void AfterOverlay(List* aList)
     g_ResourceBarrier(aList, 1, &b3);
     D3D12_BOX all{0, 0, 0, bw, bh, 1};
     g_CopyTextureRegion(aList, &tex, x0, y0, 0, &dst, &all);
+    if (maskUsed && g_applied.load() == 120 && !g_diagDone.exchange(true))
+        DiagnosticSave(aList, bw, bh, pitch, c.mbw, c.mbh, c.mpitch, x0, y0);
     D3D12_RESOURCE_BARRIER b4[3] = {
         Transition(overlay, D3D12_RESOURCE_STATE_COPY_DEST, state),
         Transition(g_bufDst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
@@ -1245,6 +1354,7 @@ void InstallHooks(ID3D12Device* aDevice)
         void** vtable = *reinterpret_cast<void***>(list);
         g_CopyTextureRegion = reinterpret_cast<decltype(g_CopyTextureRegion)>(vtable[kList_CopyTextureRegion]);
         g_ClearRenderTargetView = reinterpret_cast<decltype(g_ClearRenderTargetView)>(vtable[kList_ClearRenderTargetView]);
+        g_CopyBufferRegion = reinterpret_cast<decltype(g_CopyBufferRegion)>(vtable[kList_CopyBufferRegion]);
         ok &= HookSlot(list, kList_DrawInstanced, &HkDrawInstanced, &g_DrawInstanced, "DrawInstanced");
         ok &= HookSlot(list, kList_DrawIndexedInstanced, &HkDrawIndexedInstanced, &g_DrawIndexedInstanced,
                        "DrawIndexedInstanced");
@@ -1428,7 +1538,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Outline Fix 0.3.2 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Outline Fix 0.3.3 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -1442,7 +1552,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLOutlineFix";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 2);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 3);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
