@@ -138,8 +138,12 @@ std::shared_mutex g_psoMutex;
 std::unordered_set<void*> g_overlayPsos;
 
 UINT g_viewStep = 0;
+// UAV descriptors -> texture. g_uavs: where the game creates UAVs (always tracked; rare calls).
+// g_visUavs: copies of them into the shader-visible heap, tracked only while aiming (the game
+// copies thousands of descriptors per frame) and emptied when aiming starts, so never stale.
 std::shared_mutex g_descMutex;
-std::unordered_map<SIZE_T, ID3D12Resource*> g_uavs; // CPU descriptor -> texture, UAVs only
+std::unordered_map<SIZE_T, ID3D12Resource*> g_uavs;
+std::unordered_map<SIZE_T, ID3D12Resource*> g_visUavs;
 
 struct HeapInfo
 {
@@ -216,9 +220,28 @@ struct ListState
     std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rts;
     bool hasDs = false;
     D3D12_CPU_DESCRIPTOR_HANDLE ds{};
+    // Tracked only if the list was reset while aiming, so its state is complete from the start.
+    bool tracked = false;
 };
 std::mutex g_listMutex;
-std::unordered_map<void*, ListState> g_lists;
+std::unordered_map<void*, ListState> g_lists; // node-based: a state's address never changes
+
+// A command list is recorded by one thread at a time, so each thread remembers the list it is
+// recording and its state, and only takes the lock when it moves to another list.
+thread_local void* tl_list = nullptr;
+thread_local ListState* tl_state = nullptr;
+ListState& StateFor(void* aList)
+{
+    if (aList == tl_list)
+        return *tl_state;
+    std::lock_guard lock(g_listMutex);
+    ListState& state = g_lists[aList];
+    tl_list = aList;
+    tl_state = &state;
+    return state;
+}
+
+std::atomic<ID3D12Resource*> g_overlayRes{nullptr}; // the outline layer, once found
 
 // ---------------------------------------------------------------------------------------------
 // Our compute pass.
@@ -337,7 +360,6 @@ D3D12_CPU_DESCRIPTOR_HANDLE g_maskRtv{};
 UINT g_maskW = 0, g_maskH = 0;
 bool g_maskDrawn = false;
 std::atomic<bool> g_lensActive{false};
-std::atomic<uint32_t> g_maskDraws{0}; // glass draws put into the mask since the last remap
 std::atomic<bool> g_ready{false};
 std::atomic<uint64_t> g_applied{0};
 
@@ -582,8 +604,8 @@ ID3D12Resource* FindOverlay(const ListState& aState)
         {
             if (e.kind != 'U')
                 continue;
-            auto it = g_uavs.find(cpu + static_cast<SIZE_T>(e.offset) * g_viewStep);
-            if (it == g_uavs.end() || !it->second)
+            auto it = g_visUavs.find(cpu + static_cast<SIZE_T>(e.offset) * g_viewStep);
+            if (it == g_visUavs.end() || !it->second)
                 continue;
             D3D12_RESOURCE_DESC d = it->second->GetDesc();
             if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 640 &&
@@ -592,112 +614,6 @@ ID3D12Resource* FindOverlay(const ListState& aState)
         }
     }
     return nullptr;
-}
-
-// One-time diagnostic (about 2 seconds into the first aim): copies the layer box before and
-// after the remap and the lens mask box to readback buffers, then a thread saves them to
-// red4ext\logs\szl-fixdump-*.bin and logs where the mask and the outlines are.
-using CopyBufferRegionFn = void(STDMETHODCALLTYPE*)(List*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64);
-CopyBufferRegionFn g_CopyBufferRegion = nullptr;
-std::atomic<bool> g_diagDone{false};
-
-ID3D12Resource* Readback(UINT64 aSize)
-{
-    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
-    D3D12_RESOURCE_DESC bd{};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = aSize;
-    bd.Height = 1;
-    bd.DepthOrArraySize = 1;
-    bd.MipLevels = 1;
-    bd.SampleDesc.Count = 1;
-    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ID3D12Resource* r = nullptr;
-    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                 IID_PPV_ARGS(&r))))
-        return nullptr;
-    return r;
-}
-
-// Called with g_bufSrc and g_bufMask in NON_PIXEL_SHADER_RESOURCE and g_bufDst in COPY_SOURCE;
-// leaves them that way.
-void DiagnosticSave(List* aList, UINT aW, UINT aH, UINT aPitch, UINT aMw, UINT aMh, UINT aMpitch, UINT aX0, UINT aY0)
-{
-    UINT64 layerBytes = static_cast<UINT64>(aPitch) * aH, maskBytes = static_cast<UINT64>(aMpitch) * aMh;
-    ID3D12Resource* rbSrc = Readback(layerBytes);
-    ID3D12Resource* rbDst = Readback(layerBytes);
-    ID3D12Resource* rbMask = Readback(maskBytes);
-    if (!rbSrc || !rbDst || !rbMask || !g_CopyBufferRegion)
-    {
-        Info("diagnostic: could not create readback buffers");
-        return;
-    }
-    D3D12_RESOURCE_BARRIER to[2] = {
-        Transition(g_bufSrc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        Transition(g_bufMask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE)};
-    g_ResourceBarrier(aList, 2, to);
-    g_CopyBufferRegion(aList, rbSrc, 0, g_bufSrc, 0, layerBytes);
-    g_CopyBufferRegion(aList, rbDst, 0, g_bufDst, 0, layerBytes);
-    g_CopyBufferRegion(aList, rbMask, 0, g_bufMask, 0, maskBytes);
-    D3D12_RESOURCE_BARRIER back[2] = {
-        Transition(g_bufSrc, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        Transition(g_bufMask, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
-    g_ResourceBarrier(aList, 2, back);
-
-    std::thread([=] {
-        Sleep(3000); // long after the frame has run on the GPU
-        wchar_t exe[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        std::wstring logs = exe;
-        for (int i = 0; i < 3; ++i)
-            logs = logs.substr(0, logs.find_last_of(L'\\'));
-        logs += L"\\red4ext\\logs\\";
-        auto save = [&](ID3D12Resource* aRb, UINT64 aBytes, const wchar_t* aName) -> std::vector<uint8_t> {
-            std::vector<uint8_t> bytes(aBytes);
-            void* p = nullptr;
-            D3D12_RANGE r{0, static_cast<SIZE_T>(aBytes)};
-            if (SUCCEEDED(aRb->Map(0, &r, &p)))
-            {
-                memcpy(bytes.data(), p, aBytes);
-                D3D12_RANGE none{0, 0};
-                aRb->Unmap(0, &none);
-            }
-            aRb->Release();
-            FILE* f = nullptr;
-            if (_wfopen_s(&f, (logs + aName).c_str(), L"wb") == 0 && f)
-            {
-                fwrite(bytes.data(), 1, bytes.size(), f);
-                fclose(f);
-            }
-            return bytes;
-        };
-        wchar_t nameSrc[96], nameDst[96], nameMask[96];
-        swprintf(nameSrc, 96, L"szl-fixdump-before_%ux%u_pitch%u.bin", aW, aH, aPitch);
-        swprintf(nameDst, 96, L"szl-fixdump-after_%ux%u_pitch%u.bin", aW, aH, aPitch);
-        swprintf(nameMask, 96, L"szl-fixdump-mask_%ux%u_pitch%u.bin", aMw, aMh, aMpitch);
-        auto src = save(rbSrc, layerBytes, nameSrc);
-        auto dst = save(rbDst, layerBytes, nameDst);
-        auto mask = save(rbMask, maskBytes, nameMask);
-        auto box = [](const std::vector<uint8_t>& b, UINT w, UINT h, UINT pitch, UINT bpp, UINT ch, UINT minV,
-                      UINT& n, UINT& xa, UINT& ya, UINT& xb, UINT& yb) {
-            n = 0, xa = ya = UINT_MAX, xb = yb = 0;
-            for (UINT y = 0; y < h; ++y)
-                for (UINT x = 0; x < w; ++x)
-                    if (b[static_cast<size_t>(y) * pitch + x * bpp + ch] >= minV)
-                    {
-                        ++n;
-                        xa = std::min(xa, x), ya = std::min(ya, y), xb = std::max(xb, x), yb = std::max(yb, y);
-                    }
-        };
-        UINT n, xa, ya, xb, yb;
-        box(mask, aMw, aMh, aMpitch, 1, 0, 128, n, xa, ya, xb, yb);
-        Info("diagnostic: mask %u lens pixels, box x %u..%u y %u..%u (in the search box at %u,%u)", n, xa, xb, ya, yb,
-             aX0, aY0);
-        box(src, aW, aH, aPitch, 4, 3, 230, n, xa, ya, xb, yb);
-        Info("diagnostic: before %u outline pixels, box x %u..%u y %u..%u", n, xa, xb, ya, yb);
-        box(dst, aW, aH, aPitch, 4, 3, 230, n, xa, ya, xb, yb);
-        Info("diagnostic: after %u outline pixels, box x %u..%u y %u..%u", n, xa, xb, ya, yb);
-    }).detach();
 }
 
 void Restore(List* aList, const ListState& s)
@@ -754,17 +670,13 @@ void AfterOverlay(List* aList)
         }
     }
 
-    ListState s;
-    {
-        std::lock_guard lock(g_listMutex);
-        auto it = g_lists.find(aList);
-        if (it == g_lists.end() || !it->second.rootSig)
-            return;
-        s = it->second;
-    }
+    const ListState& s = StateFor(aList);
+    if (!s.tracked || !s.rootSig)
+        return;
     ID3D12Resource* overlay = FindOverlay(s);
     if (!overlay)
         return;
+    g_overlayRes = overlay;
     auto st = s.states.find(overlay);
     if (st == s.states.end())
         return; // not moved in this list: its state is unknown, so leave it alone
@@ -871,8 +783,6 @@ void AfterOverlay(List* aList)
     g_ResourceBarrier(aList, 1, &b3);
     D3D12_BOX all{0, 0, 0, bw, bh, 1};
     g_CopyTextureRegion(aList, &tex, x0, y0, 0, &dst, &all);
-    if (maskUsed && g_applied.load() == 120 && !g_diagDone.exchange(true))
-        DiagnosticSave(aList, bw, bh, pitch, c.mbw, c.mbh, c.mpitch, x0, y0);
     D3D12_RESOURCE_BARRIER b4[3] = {
         Transition(overlay, D3D12_RESOURCE_STATE_COPY_DEST, state),
         Transition(g_bufDst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
@@ -886,11 +796,9 @@ void AfterOverlay(List* aList)
     }
     Restore(aList, s);
 
-    uint32_t draws = g_maskDraws.exchange(0);
-    if (g_applied++ < 8)
-        Info("remap %llu: layer %llux%u, box %ux%u at %u,%u, magnification %.2f, lens mask %s (%u glass draws)",
-             static_cast<unsigned long long>(g_applied.load()), static_cast<unsigned long long>(d.Width), d.Height, bw,
-             bh, x0, y0, m, maskUsed ? "used" : "NOT used", draws);
+    if (g_applied++ == 0)
+        Info("first remap: layer %llux%u, magnification %.2f, lens mask %s", static_cast<unsigned long long>(d.Width),
+             d.Height, m, maskUsed ? "used" : "not used (fallback circle)");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1045,6 +953,7 @@ void STDMETHODCALLTYPE HkCreateUnorderedAccessView(ID3D12Device* aSelf, ID3D12Re
     g_CreateUnorderedAccessView(aSelf, aRes, aCounter, aDesc, aHandle);
     std::unique_lock lock(g_descMutex);
     g_uavs[aHandle.ptr] = aRes;
+    g_visUavs.erase(aHandle.ptr); // in case it was written straight into the shader-visible heap
 }
 
 void CopyRange(SIZE_T aDst, SIZE_T aSrc, UINT aCount)
@@ -1052,12 +961,20 @@ void CopyRange(SIZE_T aDst, SIZE_T aSrc, UINT aCount)
     std::unique_lock lock(g_descMutex);
     for (UINT i = 0; i < aCount; ++i)
     {
+        SIZE_T from = aSrc + static_cast<SIZE_T>(i) * g_viewStep;
         SIZE_T to = aDst + static_cast<SIZE_T>(i) * g_viewStep;
-        auto it = g_uavs.find(aSrc + static_cast<SIZE_T>(i) * g_viewStep);
-        if (it != g_uavs.end())
-            g_uavs[to] = it->second;
-        else
-            g_uavs.erase(to);
+        auto it = g_uavs.find(from);
+        if (it == g_uavs.end())
+        {
+            it = g_visUavs.find(from);
+            if (it == g_visUavs.end())
+            {
+                if (!g_visUavs.empty())
+                    g_visUavs.erase(to);
+                continue;
+            }
+        }
+        g_visUavs[to] = it->second;
     }
 }
 
@@ -1068,7 +985,7 @@ void STDMETHODCALLTYPE HkCopyDescriptorsSimple(ID3D12Device* aSelf, UINT aCount,
                                                D3D12_CPU_DESCRIPTOR_HANDLE aSrc, D3D12_DESCRIPTOR_HEAP_TYPE aType)
 {
     g_CopyDescriptorsSimple(aSelf, aCount, aDst, aSrc, aType);
-    if (aType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+    if (aType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && g_lensActive.load(std::memory_order_relaxed))
         CopyRange(aDst.ptr, aSrc.ptr, aCount);
 }
 
@@ -1081,7 +998,8 @@ void STDMETHODCALLTYPE HkCopyDescriptors(ID3D12Device* aSelf, UINT aDstRanges, c
                                          const UINT* aSrcSizes, D3D12_DESCRIPTOR_HEAP_TYPE aType)
 {
     g_CopyDescriptors(aSelf, aDstRanges, aDsts, aDstSizes, aSrcRanges, aSrcs, aSrcSizes, aType);
-    if (aType != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !aDsts || !aSrcs)
+    if (aType != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !aDsts || !aSrcs ||
+        !g_lensActive.load(std::memory_order_relaxed))
         return;
     UINT di = 0, dOff = 0, si = 0, sOff = 0;
     while (di < aDstRanges && si < aSrcRanges)
@@ -1110,42 +1028,45 @@ HRESULT STDMETHODCALLTYPE HkReset(List* aSelf, ID3D12CommandAllocator* aAlloc, I
 ORIG(Reset);
 HRESULT STDMETHODCALLTYPE HkReset(List* aSelf, ID3D12CommandAllocator* aAlloc, ID3D12PipelineState* aPso)
 {
-    {
-        std::lock_guard lock(g_listMutex);
-        auto& s = g_lists[aSelf];
-        s = ListState{};
-        s.pso = aPso;
-    }
+    ListState& s = StateFor(aSelf);
+    s = ListState{};
+    s.tracked = g_lensActive.load(std::memory_order_relaxed);
+    s.pso = aPso;
     return g_Reset(aSelf, aAlloc, aPso);
 }
 
+// Not aiming, these only look up the list in a thread-local and pass straight on.
+
 void STDMETHODCALLTYPE HkSetPipelineState(List* aSelf, ID3D12PipelineState* aPso)
 {
-    {
-        std::lock_guard lock(g_listMutex);
-        g_lists[aSelf].pso = aPso;
-    }
+    ListState& s = StateFor(aSelf);
+    if (s.tracked)
+        s.pso = aPso;
     g_SetPipelineState(aSelf, aPso);
 }
 
 void STDMETHODCALLTYPE HkResourceBarrier(List* aSelf, UINT aCount, const D3D12_RESOURCE_BARRIER* aBarriers)
 {
-    if (aBarriers)
+    ListState& s = StateFor(aSelf);
+    if (s.tracked && aBarriers)
     {
-        std::lock_guard lock(g_listMutex);
-        auto& s = g_lists[aSelf];
+        // Once the outline layer is known, only its state matters.
+        ID3D12Resource* only = g_overlayRes.load(std::memory_order_relaxed);
         for (UINT i = 0; i < aCount; ++i)
-            if (aBarriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
-                s.states[aBarriers[i].Transition.pResource] = aBarriers[i].Transition.StateAfter;
+        {
+            const auto& b = aBarriers[i];
+            if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && (!only || b.Transition.pResource == only))
+                s.states[b.Transition.pResource] = b.Transition.StateAfter;
+        }
     }
     g_ResourceBarrier(aSelf, aCount, aBarriers);
 }
 
 void STDMETHODCALLTYPE HkSetComputeRootSignature(List* aSelf, ID3D12RootSignature* aRs)
 {
+    ListState& s = StateFor(aSelf);
+    if (s.tracked)
     {
-        std::lock_guard lock(g_listMutex);
-        auto& s = g_lists[aSelf];
         s.rootSig = aRs;
         s.tables.clear();
         s.cbvs.clear();
@@ -1159,17 +1080,14 @@ void STDMETHODCALLTYPE HkSetComputeRootSignature(List* aSelf, ID3D12RootSignatur
 
 void STDMETHODCALLTYPE HkSetComputeRootDescriptorTable(List* aSelf, UINT aIndex, D3D12_GPU_DESCRIPTOR_HANDLE aBase)
 {
-    {
-        std::lock_guard lock(g_listMutex);
-        g_lists[aSelf].tables[aIndex] = aBase.ptr;
-    }
+    ListState& s = StateFor(aSelf);
+    if (s.tracked)
+        s.tables[aIndex] = aBase.ptr;
     g_SetComputeRootDescriptorTable(aSelf, aIndex, aBase);
 }
 
-void SetConsts(List* aList, UINT aIndex, UINT aCount, const uint32_t* aData, UINT aOffset)
+void SetConsts(ListState& s, UINT aIndex, UINT aCount, const uint32_t* aData, UINT aOffset)
 {
-    std::lock_guard lock(g_listMutex);
-    auto& s = g_lists[aList];
     auto& values = s.consts[aIndex];
     auto& mask = s.constMask[aIndex];
     for (UINT i = 0; i < aCount && aOffset + i < 64; ++i)
@@ -1181,51 +1099,51 @@ void SetConsts(List* aList, UINT aIndex, UINT aCount, const uint32_t* aData, UIN
 
 void STDMETHODCALLTYPE HkSetComputeRoot32BitConstant(List* aSelf, UINT aIndex, UINT aValue, UINT aOffset)
 {
-    SetConsts(aSelf, aIndex, 1, &aValue, aOffset);
+    ListState& s = StateFor(aSelf);
+    if (s.tracked)
+        SetConsts(s, aIndex, 1, &aValue, aOffset);
     g_SetComputeRoot32BitConstant(aSelf, aIndex, aValue, aOffset);
 }
 
 void STDMETHODCALLTYPE HkSetComputeRoot32BitConstants(List* aSelf, UINT aIndex, UINT aCount, const void* aData,
                                                       UINT aOffset)
 {
-    if (aData)
-        SetConsts(aSelf, aIndex, aCount, static_cast<const uint32_t*>(aData), aOffset);
+    ListState& s = StateFor(aSelf);
+    if (s.tracked && aData)
+        SetConsts(s, aIndex, aCount, static_cast<const uint32_t*>(aData), aOffset);
     g_SetComputeRoot32BitConstants(aSelf, aIndex, aCount, aData, aOffset);
 }
 
 void STDMETHODCALLTYPE HkSetComputeRootConstantBufferView(List* aSelf, UINT aIndex, D3D12_GPU_VIRTUAL_ADDRESS aVa)
 {
-    {
-        std::lock_guard lock(g_listMutex);
-        g_lists[aSelf].cbvs[aIndex] = aVa;
-    }
+    ListState& s = StateFor(aSelf);
+    if (s.tracked)
+        s.cbvs[aIndex] = aVa;
     g_SetComputeRootConstantBufferView(aSelf, aIndex, aVa);
 }
 
 void STDMETHODCALLTYPE HkSetComputeRootShaderResourceView(List* aSelf, UINT aIndex, D3D12_GPU_VIRTUAL_ADDRESS aVa)
 {
-    {
-        std::lock_guard lock(g_listMutex);
-        g_lists[aSelf].srvs[aIndex] = aVa;
-    }
+    ListState& s = StateFor(aSelf);
+    if (s.tracked)
+        s.srvs[aIndex] = aVa;
     g_SetComputeRootShaderResourceView(aSelf, aIndex, aVa);
 }
 
 void STDMETHODCALLTYPE HkSetComputeRootUnorderedAccessView(List* aSelf, UINT aIndex, D3D12_GPU_VIRTUAL_ADDRESS aVa)
 {
-    {
-        std::lock_guard lock(g_listMutex);
-        g_lists[aSelf].uavs[aIndex] = aVa;
-    }
+    ListState& s = StateFor(aSelf);
+    if (s.tracked)
+        s.uavs[aIndex] = aVa;
     g_SetComputeRootUnorderedAccessView(aSelf, aIndex, aVa);
 }
 
 void STDMETHODCALLTYPE HkOMSetRenderTargets(List* aSelf, UINT aCount, const D3D12_CPU_DESCRIPTOR_HANDLE* aRts,
                                             BOOL aSingleRange, const D3D12_CPU_DESCRIPTOR_HANDLE* aDs)
 {
+    ListState& s = StateFor(aSelf);
+    if (s.tracked)
     {
-        std::lock_guard lock(g_listMutex);
-        auto& s = g_lists[aSelf];
         s.rtsKnown = true;
         s.rts.clear();
         for (UINT i = 0; i < aCount && aRts; ++i)
@@ -1238,24 +1156,16 @@ void STDMETHODCALLTYPE HkOMSetRenderTargets(List* aSelf, UINT aCount, const D3D1
 }
 
 // After a scope glass draw: the same draw again with the twin pipeline into our lens mask, then
-// the game's render targets and pipeline are put back. Does nothing when the lens fix is off or
-// the draw's targets are unknown.
+// the game's render targets and pipeline are put back. Does nothing when not aiming or when the
+// draw's targets are unknown.
 template<typename Redraw>
 void LensMaskDraw(List* aList, Redraw aRedraw)
 {
     if (!g_lensActive.load(std::memory_order_relaxed) || !g_ready)
         return;
-    ListState s;
-    {
-        std::lock_guard lock(g_listMutex);
-        auto it = g_lists.find(aList);
-        if (it == g_lists.end() || !it->second.rtsKnown || it->second.rts.empty())
-            return;
-        s.pso = it->second.pso;
-        s.rts = it->second.rts;
-        s.hasDs = it->second.hasDs;
-        s.ds = it->second.ds;
-    }
+    ListState& s = StateFor(aList);
+    if (!s.tracked || !s.rtsKnown || s.rts.empty())
+        return;
     ID3D12PipelineState* twin = nullptr;
     {
         std::shared_lock lock(g_lensPsoMutex);
@@ -1282,7 +1192,6 @@ void LensMaskDraw(List* aList, Redraw aRedraw)
     g_OMSetRenderTargets(aList, static_cast<UINT>(s.rts.size()), s.rts.data(), FALSE, s.hasDs ? &s.ds : nullptr);
     g_SetPipelineState(aList, static_cast<ID3D12PipelineState*>(s.pso));
     g_maskDrawn = true;
-    ++g_maskDraws;
 }
 
 void STDMETHODCALLTYPE HkDrawInstanced(List* aSelf, UINT aVerts, UINT aInst, UINT aStartVert, UINT aStartInst)
@@ -1301,15 +1210,13 @@ void STDMETHODCALLTYPE HkDrawIndexedInstanced(List* aSelf, UINT aIdx, UINT aInst
 void STDMETHODCALLTYPE HkDispatch(List* aSelf, UINT aX, UINT aY, UINT aZ)
 {
     g_Dispatch(aSelf, aX, aY, aZ);
-    void* pso;
-    {
-        std::lock_guard lock(g_listMutex);
-        pso = g_lists[aSelf].pso;
-    }
+    ListState& s = StateFor(aSelf);
+    if (!s.tracked)
+        return;
     bool overlay;
     {
         std::shared_lock lock(g_psoMutex);
-        overlay = g_overlayPsos.count(pso) != 0;
+        overlay = g_overlayPsos.count(s.pso) != 0;
     }
     if (overlay)
         AfterOverlay(aSelf);
@@ -1356,7 +1263,6 @@ void InstallHooks(ID3D12Device* aDevice)
         void** vtable = *reinterpret_cast<void***>(list);
         g_CopyTextureRegion = reinterpret_cast<decltype(g_CopyTextureRegion)>(vtable[kList_CopyTextureRegion]);
         g_ClearRenderTargetView = reinterpret_cast<decltype(g_ClearRenderTargetView)>(vtable[kList_ClearRenderTargetView]);
-        g_CopyBufferRegion = reinterpret_cast<decltype(g_CopyBufferRegion)>(vtable[kList_CopyBufferRegion]);
         ok &= HookSlot(list, kList_DrawInstanced, &HkDrawInstanced, &g_DrawInstanced, "DrawInstanced");
         ok &= HookSlot(list, kList_DrawIndexedInstanced, &HkDrawIndexedInstanced, &g_DrawIndexedInstanced,
                        "DrawIndexedInstanced");
@@ -1422,6 +1328,11 @@ void OutlineLens(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int
     RED4ext::GetParameter(aFrame, &active);
     RED4ext::GetParameter(aFrame, &zoom);
     aFrame->code++;
+    if (active && !g_lensActive.load())
+    {
+        std::unique_lock descs(g_descMutex);
+        g_visUavs.clear();
+    }
     std::lock_guard lock(g_lensMutex);
     if (g_lens.active != active || g_lens.zoom != zoom)
         Info("lens %s, zoom %.2f", active ? "on" : "off", zoom);
@@ -1542,7 +1453,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle aHandle, RED4e
         bool ok = target && aSdk->hooking->Attach(aHandle, reinterpret_cast<void*>(target),
                                                   reinterpret_cast<void*>(&HkCreateDevice),
                                                   reinterpret_cast<void**>(&g_CreateDevice));
-        Info("SZL Outline Fix 0.3.5 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
+        Info("SZL Outline Fix 0.4.0 loaded; D3D12CreateDevice hook %s", ok ? "ok" : "FAILED");
     }
     else if (aReason == RED4ext::v1::EMainReason::Unload)
     {
@@ -1556,7 +1467,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* aInfo)
 {
     aInfo->name = L"SZLOutlineFix";
     aInfo->author = L"oitenk";
-    aInfo->version = RED4EXT_V1_SEMVER(0, 3, 5);
+    aInfo->version = RED4EXT_V1_SEMVER(0, 4, 0);
     aInfo->runtime = RED4EXT_V1_FILEVER(3, 0, 88, 46235);
     aInfo->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

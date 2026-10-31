@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 
 project(
   SZLOutlineFix
-  VERSION 0.3.5
+  VERSION 0.4.0
   DESCRIPTION "Test plugin: magnifies the ping outline layer inside the scope lens"
   LANGUAGES C CXX
 )
