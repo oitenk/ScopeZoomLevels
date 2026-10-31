@@ -53,12 +53,6 @@ public class SZLSettings {
 
   @runtimeProperty("ModSettings.mod", "Scope Zoom Levels")
   @runtimeProperty("ModSettings.category", "Outlines")
-  @runtimeProperty("ModSettings.displayName", "Line up outlines in the lens")
-  @runtimeProperty("ModSettings.description", "Ping and scan outlines are magnified with the lens, so they sit on the enemy you see through the scope.")
-  public let outlineFix: Bool = true;
-
-  @runtimeProperty("ModSettings.mod", "Scope Zoom Levels")
-  @runtimeProperty("ModSettings.category", "Outlines")
   @runtimeProperty("ModSettings.displayName", "Outline only in the lens")
   @runtimeProperty("ModSettings.description", "On: pinged enemies show just their outline through the scope. Off: the game's filled look.")
   public let outlineOnly: Bool = true;
@@ -168,8 +162,7 @@ public class SZLSystem extends ScriptableSystem {
       this.SetLevel(weaponID, level);
     }
     if !this.IsAiming() { level = 0; }
-    SZL_SetOutlineLens(level > 0 && this.m_settings.outlineFix, level > 0 ? lens.levels[level - 1] : 1.0,
-      this.m_settings.outlineOnly);
+    SZL_SetOutlineLens(level > 0, level > 0 ? lens.levels[level - 1] : 1.0, this.m_settings.outlineOnly);
     let zoom: String = level > 0 ? FloatToStringPrec(lens.levels[level - 1], 2) + "x" : "vanilla";
     let switched: array<CName>;
     for part in lens.parts {
